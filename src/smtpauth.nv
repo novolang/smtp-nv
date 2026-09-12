@@ -1,0 +1,264 @@
+// smtpauth.nv — the three mechanisms, as arithmetic.  Every row here
+// is `[]`.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A MECHANISM IS A FUNCTION FROM A CHALLENGE TO A RESPONSE, and
+// writing it that way is what makes it testable: RFC 2195's own
+// CRAM-MD5 example — the challenge, the shared secret and the exact
+// hex digest it produces — is an assertion in
+// `tests/smtpauth_tests.nv`, and a mechanism that reached for a socket
+// or a clock could not have been checked against it.
+//
+// THE ORDER `best_mechanism` PREFERS IS NOT THE ORDER OF STRENGTH.
+// CRAM-MD5 never sends the password and PLAIN sends it in the clear,
+// so a reader expects CRAM-MD5 first.  It is second, and the reason is
+// that on a TLS connection PLAIN is fine and CRAM-MD5 requires the
+// server to hold the password in a form it can compute HMAC from —
+// which means plaintext or reversible storage, which is worse than
+// anything it protects against.  So: PLAIN over TLS, CRAM-MD5 without
+// it, and LOGIN only when a server offers nothing else.
+//
+// AND WITHOUT TLS THE ANSWER IS USUALLY "DO NOT".  PLAIN on a
+// cleartext connection is the password, base64'd, which is not
+// encryption.  `is_safe_without_tls` answers that question with the
+// mechanism as its only argument, and `smtpsend` refuses rather than
+// asking, unless the caller has said it means it.
+
+// The mechanisms this package speaks.
+pub enum SmtpMechanism
+    // RFC 4616.  One base64 blob: `\0user\0password`.  The password
+    // travels, so this belongs on a TLS connection and nowhere else.
+    SmtpAuthPlain
+    // Two base64 blobs, username then password, each after a server
+    // prompt.  Not a standard at all — it is Microsoft's, and it is
+    // documented only in an expired draft — but a submission server
+    // that offers only LOGIN is one a client without it cannot use.
+    SmtpAuthLogin
+    // RFC 2195.  The server sends a challenge, the client answers
+    // `user hmac-md5(secret, challenge)` in hex.  The password never
+    // travels; the server has to be able to compute the same HMAC,
+    // which means it stores something equivalent to the password.
+    SmtpAuthCramMd5
+
+// One step of an exchange: what to send, or that it is over.
+pub enum SmtpAuthStep
+    // Send this base64 line and wait for the next `334`.
+    SmtpAuthSend(line: Str)
+    // Nothing more to send; the next reply is the verdict.
+    SmtpAuthAwaitResult
+
+// An exchange in progress.
+//
+// A value the caller carries between turns, because LOGIN takes two
+// prompts and CRAM-MD5 takes one, and a session that tracked "which
+// prompt is this" with a counter gets the second LOGIN prompt wrong on
+// a server that sends them in the other order.
+pub struct SmtpAuthState
+    mechanism: SmtpMechanism
+    username: Str
+    secret: [u8]
+    // How many server prompts have been answered.
+    step: Int
+    done: Bool
+
+// The mechanism's name as it appears after `AUTH` and in the
+// capability list.
+//
+// ```novo
+// use smtpauth
+//
+// fn main() [io]
+//     println(smtpauth.mechanism_name(SmtpAuthPlain))
+// ```
+pub fn mechanism_name(m: SmtpMechanism) -> Str []
+    todo("smtp-nv.smtpauth.mechanism_name")
+
+// The mechanism a name denotes, or `None` for one this package does
+// not speak.
+//
+// Case-insensitive, because the capability list's case is the
+// server's.
+//
+// ```novo
+// use smtpauth
+//
+// fn main() [io]
+//     match smtpauth.mechanism_of("cram-md5")
+//         Some(_) => println("known")
+//         None    => println("not spoken here")
+// ```
+pub fn mechanism_of(name: Str) -> ?SmtpMechanism []
+    todo("smtp-nv.smtpauth.mechanism_of")
+
+// The mechanism to use, given what the server offered and whether the
+// connection is encrypted.
+//
+// On TLS: PLAIN, then CRAM-MD5, then LOGIN.  Without it: CRAM-MD5
+// only, and `None` for the rest — which is a refusal rather than a
+// preference, because PLAIN without TLS is the password in base64 and
+// base64 is not encryption.
+//
+// ```novo
+// use smtpauth
+//
+// fn main() [io]
+//     match smtpauth.best_mechanism(["PLAIN", "LOGIN"], false)
+//         Some(_) => println("chosen")
+//         None    => println("nothing safe on a cleartext connection")
+// ```
+pub fn best_mechanism(offered: [Str], tls: Bool) -> ?SmtpMechanism []
+    todo("smtp-nv.smtpauth.best_mechanism")
+
+// True when this mechanism does not put the password on a cleartext
+// wire.
+//
+// CRAM-MD5 and nothing else.  MD5 is broken for collisions and this
+// does not depend on collisions being hard; what it depends on is that
+// the password is never sent, which is true.
+//
+// ```novo
+// use smtpauth
+//
+// fn main() [io]
+//     println("${smtpauth.is_safe_without_tls(SmtpAuthPlain)}")
+// ```
+pub fn is_safe_without_tls(m: SmtpMechanism) -> Bool []
+    todo("smtp-nv.smtpauth.is_safe_without_tls")
+
+// Begin an exchange.
+//
+// The secret is bytes and not `Str`: an application password from a
+// large mail provider is generated and may be any byte sequence, and a
+// `Str` field would refuse one that is not valid UTF-8.
+//
+// ```novo
+// use smtpauth
+//
+// fn main() [io]
+//     let a = smtpauth.begin(SmtpAuthPlain, "user@example.com", [])
+//     println("${a.step}")
+// ```
+pub fn begin(m: SmtpMechanism, username: Str, secret: [u8]) -> SmtpAuthState []
+    todo("smtp-nv.smtpauth.begin")
+
+// The initial response to put on the `AUTH` command itself, or `None`
+// for a mechanism that has none.
+//
+// PLAIN has one and saves a round trip; LOGIN and CRAM-MD5 do not,
+// because both need something the server has not sent yet.  A client
+// that sent an initial response for CRAM-MD5 would be answering a
+// challenge it invented.
+//
+// ```novo
+// use smtpauth
+//
+// fn main() [io]
+//     let a = smtpauth.begin(SmtpAuthPlain, "user", [])
+//     match smtpauth.initial_response(a)
+//         Some(_) => println("saves a round trip")
+//         None    => println("needs a prompt first")
+// ```
+pub fn initial_response(a: SmtpAuthState) -> ?Str []
+    todo("smtp-nv.smtpauth.initial_response")
+
+// Answer a server prompt.
+//
+// `challenge` is the base64 text the server sent after its `334`,
+// which is empty for LOGIN's prompts and the challenge string for
+// CRAM-MD5.
+//
+// ```novo
+// use smtpauth
+//
+// fn main() [io]
+//     let a = smtpauth.begin(SmtpAuthCramMd5, "user", [])
+//     match smtpauth.answer(a, "")
+//         Ok(_)  => println("answered")
+//         Err(_) => println("refused")
+// ```
+pub fn answer(a: SmtpAuthState, challenge: Str) -> Result<SmtpAuthTurn, SmtpAuthError> []
+    todo("smtp-nv.smtpauth.answer")
+
+// The state after a prompt, and what to send.
+pub struct SmtpAuthTurn
+    state: SmtpAuthState
+    step: SmtpAuthStep
+
+// The PLAIN response for a username and a secret:
+// `base64("\0" + user + "\0" + secret)`.
+//
+// Published on its own so RFC 4616's own example is an assertion.  The
+// leading NUL is the authorization identity, which is empty for every
+// ordinary client and which a naive implementation leaves out — the
+// server then reads the username as the authorization identity and the
+// password as the username.
+//
+// ```novo
+// use smtpauth
+//
+// fn main() [io]
+//     println(smtpauth.plain_response("", "user", []))
+// ```
+pub fn plain_response(authzid: Str, username: Str, secret: [u8]) -> Str []
+    todo("smtp-nv.smtpauth.plain_response")
+
+// The CRAM-MD5 response for a challenge:
+// `base64(user + " " + hex(hmac_md5(secret, decoded_challenge)))`.
+//
+// Three details, each of which is a wrong implementation that still
+// looks right: the challenge is base64 and is decoded BEFORE it is
+// hashed, the digest is lowercase hex and not raw bytes, and the
+// separator is one space.
+//
+// ```novo
+// use smtpauth
+//
+// fn main() [io]
+//     match smtpauth.cram_md5_response("user", [], "")
+//         Ok(r)  => println(r)
+//         Err(_) => println("refused")
+// ```
+pub fn cram_md5_response(username: Str, secret: [u8],
+                         challenge_b64: Str) -> Result<Str, SmtpAuthError> []
+    todo("smtp-nv.smtpauth.cram_md5_response")
+
+// True when the exchange has nothing more to send.
+//
+// ```novo
+// use smtpauth
+//
+// fn main() [io]
+//     println("${smtpauth.is_done(smtpauth.begin(SmtpAuthPlain, "u", []))}")
+// ```
+pub fn is_done(a: SmtpAuthState) -> Bool []
+    todo("smtp-nv.smtpauth.is_done")
+
+// Why an exchange could not continue.
+pub enum SmtpAuthError
+    // The server prompted with something that is not base64.
+    SmtpChallengeNotBase64(value: Str)
+    // A username or an authorization identity with a NUL in it, which
+    // would be read as a field separator.
+    SmtpNulInCredential(what: Str)
+    // The server prompted more times than the mechanism has answers.
+    SmtpUnexpectedPrompt(step: Int)
+    // The server offered no mechanism this client will use on this
+    // connection — which on a cleartext connection usually means it
+    // offered only PLAIN and LOGIN.
+    SmtpNoUsableMechanism(offered: [Str], tls: Bool)
+    // The server answered the exchange with a 5yz.
+    SmtpAuthRejected(code: Int, text: Str)
+
+// The one-line reading, for a log or a person.
+//
+// ```novo
+// use smtpauth
+//
+// fn main() [io]
+//     let e: SmtpAuthError = SmtpUnexpectedPrompt(3)
+//     println(e.message())
+// ```
+impl Error for SmtpAuthError
+    fn message(self) -> Str
+        todo("smtp-nv.smtpauth.AuthError.message")

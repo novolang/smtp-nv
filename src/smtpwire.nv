@@ -1,0 +1,443 @@
+// smtpwire.nv — the command and reply codec.  Sans-IO, and every row
+// here is `[]`.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THIS MODULE IS `core`-SHAPED INSIDE A `host` PACKAGE, and that is a
+// decision rather than an accident.  There is no `smtp-codec-nv` on
+// the grid: SMTP's wire format is a line, a three-digit number and a
+// space — perhaps two hundred lines of arithmetic all told — and the
+// whole of the interesting behaviour is in the conversation rather than
+// in the bytes.  A separate package would have been a package whose
+// README said "this parses `250 OK`", which is not a package anybody
+// browses to.  The README argues what would change that.
+//
+// SO THE RULE IS KEPT WITHOUT THE PACKAGE: nothing in this module
+// performs anything, everything is a function from bytes or values to
+// values, and a test asserts an entire session transcript with no
+// socket.  If SMTP ever grows a second consumer that wants the codec
+// and not the session — a server, a milter, a proxy — this module
+// lifts out unchanged.
+//
+// THE THREE THINGS A WRONG SMTP CODEC GETS WRONG QUIETLY, each of
+// which is an assertion in `tests/smtpwire_tests.nv`:
+//
+//   A MULTILINE REPLY IS ONE REPLY.  `250-SIZE` continues and
+//   `250 SIZE` ends, and the difference is one character in column
+//   four.  A client that treated each line as a reply reads the
+//   capability list as five separate answers and then answers the
+//   wrong command.
+//
+//   A LINE BEGINNING WITH A DOT IS DOUBLED, and the terminator is
+//   `\r\n.\r\n`.  A message whose body has a line that is just `.`
+//   ends the DATA early without any error at all: the server accepts
+//   half a message and the rest is interpreted as commands.
+//
+//   THE REPLY CODE'S FIRST DIGIT IS THE ONLY PART A CLIENT MAY BRANCH
+//   ON.  4 is temporary and 5 is permanent, and a client that retried
+//   a 550 or gave up on a 451 is a client that either loses mail or
+//   sends it twice.
+
+// One SMTP command, as a value.
+pub enum SmtpCommand
+    // `EHLO <domain>`.  Never `HELO` first: a submission client that
+    // opened with HELO gets no capability list, so no STARTTLS, no
+    // AUTH and no SIZE.
+    SmtpEhlo(domain: Str)
+    // `HELO <domain>`, for a server that refused EHLO.
+    SmtpHelo(domain: Str)
+    SmtpStartTls
+    // `AUTH <mechanism>` with an optional initial response, which
+    // saves a round trip where the server advertised it.
+    SmtpAuth(mechanism: Str, initial: ?Str)
+    // A bare base64 line in the middle of an AUTH exchange.
+    SmtpAuthContinue(response: Str)
+    // `MAIL FROM:<addr>` with ESMTP parameters — `SIZE=`, `BODY=`.
+    SmtpMailFrom(reverse_path: Str, params: [Str])
+    // `RCPT TO:<addr>`.  One per recipient: the envelope is not a
+    // header, and a message to twelve people is twelve of these.
+    SmtpRcptTo(forward_path: Str, params: [Str])
+    SmtpData
+    // `.` on its own line, ending DATA.
+    SmtpEndOfData
+    // `RSET`, which abandons the current transaction and keeps the
+    // session — including the authentication, which is why it is the
+    // right answer to a rejected recipient.
+    SmtpRset
+    SmtpNoop
+    SmtpQuit
+
+// A reply's leading digit, which is the only part a client may branch
+// on.
+pub enum SmtpReplyClass
+    // 2yz — it worked.
+    SmtpPositive
+    // 3yz — send more: the server is waiting for the DATA body or the
+    // next AUTH line.
+    SmtpIntermediate
+    // 4yz — TEMPORARY.  Try again later; the message is not lost.
+    SmtpTransient
+    // 5yz — PERMANENT.  Trying again gets the same answer, and a
+    // client that retried is a client sending the same rejection over
+    // and over.
+    SmtpPermanent
+
+// One reply, multiline or not.
+//
+// `lines` holds the text of every line with the code and the separator
+// removed, so a five-line capability list is five strings and the
+// caller never parses column four.
+pub struct SmtpReply
+    code: Int
+    // RFC 3463's enhanced status code — `5.7.1` — when the server sent
+    // one, and `""` when it did not.  Separate from `code` because it
+    // is the part that says WHY where the three digits say only what
+    // class, and a bounce message that quoted only the three digits is
+    // a bounce nobody can act on.
+    enhanced: Str
+    lines: [Str]
+
+// What a reader has, when it does not yet have a whole reply.
+pub enum SmtpScan
+    // More bytes are needed.
+    SmtpNeedLine
+    // A whole reply ends at this offset.
+    SmtpReplyAt(end: Int)
+
+// The reader between "some bytes turned up" and "here is a reply".
+//
+// Opaque: the fields are here because a struct needs them, and a
+// caller that reaches into one has coupled itself to a buffering
+// decision this module intends to change.
+pub struct SmtpReader
+    pending: [u8]
+    offset: Int
+    max_line: Int
+    max_lines: Int
+
+// A reader and the one reply that came out of it, if one did.
+pub struct SmtpStep
+    reader: SmtpReader
+    reply: ?SmtpReply
+
+// What an EHLO's capability list said this server can do.
+pub struct SmtpCapabilities
+    // The greeting line, before the list.
+    greeting: Str
+    starttls: Bool
+    pipelining: Bool
+    // The SMTPUTF8 extension: an address with a non-ASCII character in
+    // it may be used literally rather than punycoded.
+    smtputf8: Bool
+    // `8BITMIME`: a body may carry bytes above 127 without being
+    // encoded.
+    eight_bit_mime: Bool
+    // `SIZE` in bytes; zero when the server announced no limit.
+    max_size: Int
+    // The AUTH mechanisms the server offered, in the order it listed
+    // them.
+    auth_mechanisms: [Str]
+    // Everything else, as it arrived, for a caller that knows an
+    // extension this package does not.
+    other: [Str]
+
+// The longest line SMTP allows including CRLF, 1000 bytes.
+//
+// RFC 5321 § 4.5.3.1.6.  A message with a longer line has to be
+// encoded — quoted-printable or base64 — and `smtpmsg` is what chooses.
+pub const SMTP_LINE_MAX = 1000
+
+// The longest command line, 512 bytes.
+pub const SMTP_COMMAND_MAX = 512
+
+// The submission port, 587 (RFC 6409).
+//
+// NOT 25.  Port 25 is server-to-server relay, is blocked outbound by
+// most networks, and does not require authentication; submission is
+// 587, requires it, and is what a program sending its own mail uses.
+pub const SMTP_SUBMISSION_PORT = 587
+
+// The implicit-TLS submission port, 465 (RFC 8314).
+//
+// TLS from the first byte, with no STARTTLS at all — which is what
+// RFC 8314 now prefers, because a STARTTLS that can be stripped is a
+// STARTTLS an attacker removes.
+pub const SMTP_SUBMISSIONS_PORT = 465
+
+// The plain SMTP port, 25.
+pub const SMTP_PORT = 25
+
+// A reader with the default limits.
+//
+// ```novo
+// use smtpwire
+//
+// fn main() [io]
+//     println("${smtpwire.reader().max_line}")
+// ```
+pub fn reader() -> SmtpReader []
+    todo("smtp-nv.smtpwire.reader")
+
+// A reader with limits of the caller's own.
+//
+// ```novo
+// use smtpwire
+//
+// fn main() [io]
+//     println("${smtpwire.reader_with(1000, 64).max_lines}")
+// ```
+pub fn reader_with(max_line: Int, max_lines: Int) -> SmtpReader []
+    todo("smtp-nv.smtpwire.reader_with")
+
+// Whether a buffer holds a whole reply yet, without consuming
+// anything.
+//
+// For a caller sizing its next read.
+//
+// ```novo
+// use smtpwire
+//
+// fn main() [io]
+//     match smtpwire.scan([])
+//         SmtpNeedLine    => println("more")
+//         SmtpReplyAt(at) => println("${at}")
+// ```
+pub fn scan(buf: [u8]) -> SmtpScan []
+    todo("smtp-nv.smtpwire.scan")
+
+// Feed bytes, and take the first reply they completed.
+//
+// ```novo
+// use smtpwire
+//
+// fn main() [io]
+//     match smtpwire.feed(smtpwire.reader(), [])
+//         Ok(_)  => println("fed")
+//         Err(_) => println("refused")
+// ```
+pub fn feed(r: SmtpReader, data: [u8]) -> Result<SmtpStep, SmtpWireError> []
+    todo("smtp-nv.smtpwire.feed")
+
+// Take the next reply out of what has already been fed.
+//
+// ```novo
+// use smtpwire
+//
+// fn main() [io]
+//     match smtpwire.take(smtpwire.reader())
+//         Ok(_)  => println("taken")
+//         Err(_) => println("refused")
+// ```
+pub fn take(r: SmtpReader) -> Result<SmtpStep, SmtpWireError> []
+    todo("smtp-nv.smtpwire.take")
+
+// How many fed bytes have not yet made a reply.
+//
+// ```novo
+// use smtpwire
+//
+// fn main() [io]
+//     println("${smtpwire.pending_len(smtpwire.reader())}")
+// ```
+pub fn pending_len(r: SmtpReader) -> Int []
+    todo("smtp-nv.smtpwire.pending_len")
+
+// One whole reply parsed out of a complete buffer.
+//
+// The convenience for a caller that already has the bytes.
+//
+// ```novo
+// use smtpwire
+//
+// fn main() [io]
+//     match smtpwire.parse_reply([])
+//         Ok(r)  => println("${r.code}")
+//         Err(_) => println("not a reply")
+// ```
+pub fn parse_reply(buf: [u8]) -> Result<SmtpReply, SmtpWireError> []
+    todo("smtp-nv.smtpwire.parse_reply")
+
+// The class of a reply code — the only part a client may branch on.
+//
+// A client that retried a 550 sends the same rejection over and over;
+// one that gave up on a 451 loses mail that would have gone through in
+// a minute.
+//
+// ```novo
+// use smtpwire
+//
+// fn main() [io]
+//     match smtpwire.class_of(451)
+//         SmtpTransient => println("try again")
+//         _             => println("something else")
+// ```
+pub fn class_of(code: Int) -> SmtpReplyClass []
+    todo("smtp-nv.smtpwire.class_of")
+
+// True for a 2yz.
+//
+// ```novo
+// use smtpwire
+//
+// fn main() [io]
+//     println("${smtpwire.is_positive(250)}")
+// ```
+pub fn is_positive(code: Int) -> Bool []
+    todo("smtp-nv.smtpwire.is_positive")
+
+// True when trying the same thing later could work: a 4yz, and
+// nothing else.
+//
+// ```novo
+// use smtpwire
+//
+// fn main() [io]
+//     println("${smtpwire.is_temporary(451)}")
+// ```
+pub fn is_temporary(code: Int) -> Bool []
+    todo("smtp-nv.smtpwire.is_temporary")
+
+// The bytes of a command, CRLF included.
+//
+// ```novo
+// use smtpwire
+// use std.list
+//
+// fn main() [io]
+//     match smtpwire.encode(SmtpQuit)
+//         Ok(b)  => println("${list.len(b)}")
+//         Err(_) => println("refused")
+// ```
+pub fn encode(c: SmtpCommand) -> Result<[u8], SmtpWireError> []
+    todo("smtp-nv.smtpwire.encode")
+
+// The capability list an EHLO reply describes.
+//
+// ```novo
+// use smtpwire
+//
+// fn main() [io]
+//     let r = SmtpReply { code: 250, enhanced: "", lines: [] }
+//     println("${smtpwire.capabilities_of(r).starttls}")
+// ```
+pub fn capabilities_of(r: SmtpReply) -> SmtpCapabilities []
+    todo("smtp-nv.smtpwire.capabilities_of")
+
+// Capabilities with nothing announced.
+//
+// What a session holds before EHLO, and — this is the load-bearing
+// use — what it is reset to the moment STARTTLS succeeds.
+//
+// ```novo
+// use smtpwire
+//
+// fn main() [io]
+//     println("${smtpwire.no_capabilities().pipelining}")
+// ```
+pub fn no_capabilities() -> SmtpCapabilities []
+    todo("smtp-nv.smtpwire.no_capabilities")
+
+// A message body with its dots stuffed and its terminator appended,
+// ready to follow a DATA.
+//
+// Both halves in one function, because a caller that stuffed and
+// forgot the terminator hangs and a caller that terminated without
+// stuffing truncates — and the second is silent.
+//
+// ```novo
+// use smtpwire
+// use std.list
+//
+// fn main() [io]
+//     match smtpwire.data_body([])
+//         Ok(b)  => println("${list.len(b)}")
+//         Err(_) => println("refused")
+// ```
+pub fn data_body(message: [u8]) -> Result<[u8], SmtpWireError> []
+    todo("smtp-nv.smtpwire.data_body")
+
+// The reverse of `data_body`: a transmitted body back to the message
+// it was made from.
+//
+// Published because it is what makes `data_body` testable as a round
+// trip, and because a proxy needs it.
+//
+// ```novo
+// use smtpwire
+// use std.list
+//
+// fn main() [io]
+//     match smtpwire.undo_dot_stuffing([])
+//         Ok(b)  => println("${list.len(b)}")
+//         Err(_) => println("refused")
+// ```
+pub fn undo_dot_stuffing(transmitted: [u8]) -> Result<[u8], SmtpWireError> []
+    todo("smtp-nv.smtpwire.undo_dot_stuffing")
+
+// How many bytes a message becomes on the wire after stuffing and
+// termination.
+//
+// What a `MAIL FROM ... SIZE=` parameter has to carry, and what a
+// server's announced `SIZE` limit is compared against.  A client that
+// declared the unstuffed length can be refused for a message that
+// would have fitted.
+//
+// ```novo
+// use smtpwire
+//
+// fn main() [io]
+//     println("${smtpwire.transmitted_size([])}")
+// ```
+pub fn transmitted_size(message: [u8]) -> Int []
+    todo("smtp-nv.smtpwire.transmitted_size")
+
+// True when a set of commands may be sent back to back without
+// waiting for each reply.
+//
+// RFC 2920's rule and not a preference: `EHLO`, `DATA`, `STARTTLS`,
+// `QUIT` and every AUTH exchange are barriers, and everything else —
+// `MAIL FROM`, every `RCPT TO`, `RSET`, `NOOP` — may be grouped.  A
+// client that pipelined a DATA has sent the body before the server
+// agreed to receive it.
+//
+// ```novo
+// use smtpwire
+//
+// fn main() [io]
+//     println("${smtpwire.may_pipeline([SmtpRset, SmtpNoop])}")
+// ```
+pub fn may_pipeline(group: [SmtpCommand]) -> Bool []
+    todo("smtp-nv.smtpwire.may_pipeline")
+
+// Why a reply or a command could not be read or written.
+pub enum SmtpWireError
+    // A reply line longer than the limit.
+    SmtpLineTooLong(at: Int, len: Int)
+    // More continuation lines than the limit, which is a server — or
+    // something pretending to be one — sending an unbounded reply.
+    SmtpTooManyReplyLines(count: Int)
+    // A line that does not begin with three digits and a separator.
+    SmtpMalformedReply(at: Int)
+    // A reply code outside 200..599.
+    SmtpReplyCodeOutOfRange(code: Int)
+    // A command argument with a CR or LF in it.  **This is the
+    // injection defence**: an address or a domain carrying a newline
+    // would end the command and begin another one the caller never
+    // wrote, which is how a header-injection bug in a web form becomes
+    // an open relay.
+    SmtpControlCharacterInArgument(what: Str)
+    // A command line longer than 512 bytes.
+    SmtpCommandTooLong(len: Int)
+
+// The one-line reading, for a log or a person.
+//
+// ```novo
+// use smtpwire
+//
+// fn main() [io]
+//     let e: SmtpWireError = SmtpTooManyReplyLines(500)
+//     println(e.message())
+// ```
+impl Error for SmtpWireError
+    fn message(self) -> Str
+        todo("smtp-nv.smtpwire.message")

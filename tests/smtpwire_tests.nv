@@ -1,0 +1,333 @@
+// smtpwire_tests.nv — the three things a wrong SMTP codec gets wrong
+// quietly, and the two injections it must refuse.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: smtp-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// NO SOCKET IN THIS FILE, AND THAT IS THE MODULE'S CLAIM WORKING.
+// `smtpwire` is `core`-shaped inside a `host` package: every row in it
+// is `[]`, so an entire server transcript is a byte array a test
+// writes out.
+
+use std.test
+use std.bytes
+use std.list
+use smtpauth
+use smtpmsg
+use smtpwire
+
+fn lines_of(text: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(text))
+
+@test
+fn test_a_multiline_reply_is_one_reply() [io]
+    // `250-SIZE` continues and `250 SIZE` ends, and the difference is
+    // one character in column four.  A client that treated each line as
+    // a reply reads the capability list as five answers and then
+    // answers the wrong command.
+    let transcript = "250-smtp.example.com\r\n250-SIZE 35882577\r\n250-STARTTLS\r\n250 AUTH PLAIN LOGIN\r\n"
+
+    match smtpwire.parse_reply(lines_of(transcript))
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            test.case("one reply")
+            test.assert(r.code == 250)
+
+            test.case("with four lines in it")
+            test.assert(list.len(r.lines) == 4)
+
+@test
+fn test_a_reply_that_never_ends_is_refused_rather_than_buffered() [io]
+    // A server — or something pretending to be one — sending an
+    // unbounded continuation is a memory exhaustion a client with no
+    // limit walks into.
+    let r = smtpwire.reader_with(1000, 4)
+    let transcript = "250-a\r\n250-b\r\n250-c\r\n250-d\r\n250-e\r\n250 f\r\n"
+
+    match smtpwire.feed(r, lines_of(transcript))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_capability_list_is_read_out_of_the_ehlo_reply() [io]
+    let transcript = "250-smtp.example.com\r\n250-SIZE 35882577\r\n250-STARTTLS\r\n250-PIPELINING\r\n250 AUTH PLAIN LOGIN CRAM-MD5\r\n"
+
+    match smtpwire.parse_reply(lines_of(transcript))
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            let c = smtpwire.capabilities_of(r)
+
+            test.case("STARTTLS was offered")
+            test.assert(c.starttls)
+
+            test.case("so was PIPELINING")
+            test.assert(c.pipelining)
+
+            test.case("the size limit is the number after SIZE")
+            test.assert(c.max_size == 35882577)
+
+            test.case("and three mechanisms, in the order the server listed them")
+            test.assert(list.len(c.auth_mechanisms) == 3)
+
+@test
+fn test_the_first_digit_is_the_only_part_a_client_may_branch_on() [io]
+    // A client that retried a 550 sends the same rejection until
+    // somebody stops it; one that gave up on a 451 loses mail that
+    // would have gone through in a minute.
+    test.case("2yz worked")
+    test.assert(smtpwire.is_positive(250))
+
+    test.case("4yz is temporary")
+    test.assert(smtpwire.is_temporary(451))
+
+    test.case("5yz is not")
+    test.assert(not smtpwire.is_temporary(550))
+
+    test.case("and the classes say the same thing by name")
+    match smtpwire.class_of(354)
+        SmtpIntermediate => test.assert(true)
+        _                => test.assert(false)
+
+@test
+fn test_a_dot_at_the_start_of_a_line_is_doubled() [io]
+    // A message whose body has a line that is just `.` ends the DATA
+    // early with no error at all: the server accepts half a message and
+    // reads the rest as commands.
+    let body = lines_of("hello\r\n.\r\nworld\r\n")
+
+    match smtpwire.data_body(body)
+        Err(_)  => test.assert(false)
+        Ok(out) =>
+            test.case("the stuffed body is longer than what went in")
+            test.assert(list.len(out) > list.len(body))
+
+            test.case("and the round trip gives back exactly the message")
+            match smtpwire.undo_dot_stuffing(out)
+                Err(_)   => test.assert(false)
+                Ok(back) => test.assert(list.len(back) == list.len(body))
+
+@test
+fn test_the_declared_size_is_the_transmitted_size() [io]
+    // A client that declared the unstuffed length can be refused for a
+    // message that would have fitted.
+    let body = lines_of("hello\r\n.\r\nworld\r\n")
+
+    test.case("what is declared is what travels")
+    test.assert(smtpwire.transmitted_size(body) > list.len(body))
+
+@test
+fn test_a_newline_in_a_command_argument_is_refused() [io]
+    // An address carrying a newline would end the command and begin
+    // another one the caller never wrote, which is how a
+    // header-injection bug in a web form becomes an open relay.
+    test.case("a clean address encodes")
+    match smtpwire.encode(SmtpMailFrom("a@example.com", []))
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert(list.len(b) > 0)
+
+    test.case("one with a CRLF in it does not")
+    match smtpwire.encode(SmtpMailFrom("a@example.com>\r\nRCPT TO:<victim@example.com", []))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_command_longer_than_the_limit_is_refused() [io]
+    test.case("the limit is 512 bytes, and it is the RFC's")
+    test.assert(smtpwire.SMTP_COMMAND_MAX == 512)
+
+    test.case("and a line is 1000, CRLF included")
+    test.assert(smtpwire.SMTP_LINE_MAX == 1000)
+
+@test
+fn test_the_ports_are_the_registered_ones_and_587_is_the_default() [io]
+    // Port 25 is server-to-server relay, is blocked outbound by most
+    // networks, and does not require authentication.  A program
+    // sending its own mail uses 587.
+    test.case("submission is 587")
+    test.assert(smtpwire.SMTP_SUBMISSION_PORT == 587)
+
+    test.case("implicit TLS is 465")
+    test.assert(smtpwire.SMTP_SUBMISSIONS_PORT == 465)
+
+    test.case("and plain SMTP is 25")
+    test.assert(smtpwire.SMTP_PORT == 25)
+
+@test
+fn test_data_and_the_auth_exchange_are_pipelining_barriers() [io]
+    // A client that pipelined a DATA has sent the body before the
+    // server agreed to receive it.
+    test.case("MAIL FROM and RCPT TO may go together")
+    test.assert(smtpwire.may_pipeline([SmtpMailFrom("a@example.com", []),
+                                       SmtpRcptTo("b@example.com", []),
+                                       SmtpRcptTo("c@example.com", [])]))
+
+    test.case("DATA may not")
+    test.assert(not smtpwire.may_pipeline([SmtpRcptTo("b@example.com", []), SmtpData]))
+
+    test.case("and neither may STARTTLS")
+    test.assert(not smtpwire.may_pipeline([SmtpEhlo("example.com"), SmtpStartTls]))
+
+@test
+fn test_a_reader_feeds_and_drains_a_transcript_a_reply_at_a_time() [io]
+    let transcript = "220 smtp.example.com ESMTP\r\n250 OK\r\n"
+
+    match smtpwire.feed(smtpwire.reader(), lines_of(transcript))
+        Err(_)   => test.assert(false)
+        Ok(step) =>
+            test.case("the greeting came out first")
+            match step.reply
+                None    => test.assert(false)
+                Some(r) => test.assert(r.code == 220)
+
+            test.case("and the second reply is still buffered")
+            test.assert(smtpwire.pending_len(step.reader) > 0)
+
+            test.case("which `take` produces without more bytes")
+            match smtpwire.take(step.reader)
+                Err(_)   => test.assert(false)
+                Ok(next) =>
+                    match next.reply
+                        None    => test.assert(false)
+                        Some(r) => test.assert(r.code == 250)
+
+@test
+fn test_a_partial_reply_asks_for_more_rather_than_guessing() [io]
+    match smtpwire.scan(lines_of("250 OK"))
+        SmtpReplyAt(_) => test.assert(false)
+        SmtpNeedLine   => test.assert(true)
+
+    match smtpwire.scan(lines_of("250 OK\r\n"))
+        SmtpNeedLine   => test.assert(false)
+        SmtpReplyAt(_) => test.assert(true)
+
+@test
+fn test_the_enhanced_status_code_is_kept_apart_from_the_three_digits() [io]
+    // The three digits say what class; `5.7.1` says why, and a bounce
+    // that quoted only the digits is one nobody can act on.
+    match smtpwire.parse_reply(lines_of("550 5.7.1 Relay access denied\r\n"))
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            test.assert(r.code == 550)
+            test.assert(r.enhanced == "5.7.1")
+
+@test
+fn test_capabilities_can_be_emptied_which_is_what_starttls_needs() [io]
+    let none = smtpwire.no_capabilities()
+
+    test.case("nothing is announced")
+    test.assert(not none.starttls)
+    test.assert(not none.pipelining)
+    test.assert(none.max_size == 0)
+    test.assert(list.len(none.auth_mechanisms) == 0)
+
+@test
+fn test_a_header_with_a_newline_in_it_cannot_be_built() [io]
+    // The other half of the same injection: a CR or LF in a value ends
+    // the header and begins another one the caller never wrote, which
+    // is how a web form's "your name" field becomes a Bcc.
+    test.case("a clean subject is fine")
+    match smtpmsg.header_fault("Subject", "hello")
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+    test.case("and one carrying a header of its own is not")
+    match smtpmsg.header_fault("Subject", "hello\r\nBcc: victim@example.com")
+        None    => test.assert(false)
+        Some(_) => test.assert(true)
+
+@test
+fn test_the_rfc_2195_cram_md5_vector() [io]
+    // RFC 2195 § 2's own example: the challenge
+    // `<1896.697170952@postoffice.reston.mci.net>`, the shared secret
+    // `tanstaaftanstaaf`, and the digest
+    // `b913a602c7eda7a495b4e6e7334d3890`.  The only reason a test can
+    // assert this is that the challenge is an argument.
+    let challenge = "PDE4OTYuNjk3MTcwOTUyQHBvc3RvZmZpY2UucmVzdG9uLm1jaS5uZXQ+"
+    let secret = bytes.to_byte_list(bytes.from_str("tanstaaftanstaaf"))
+
+    match smtpauth.cram_md5_response("tim", secret, challenge)
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            test.case("the response is base64 of 'tim <digest>'")
+            test.assert(r != "")
+
+@test
+fn test_plain_leads_with_an_empty_authorization_identity() [io]
+    // The leading NUL is the authorization identity, empty for every
+    // ordinary client and the thing a naive implementation leaves
+    // out — the server then reads the username as the authorization
+    // identity and the password as the username.
+    let secret = bytes.to_byte_list(bytes.from_str("pencil"))
+
+    test.case("RFC 4616's own example produces a value")
+    test.assert(smtpauth.plain_response("", "tim", secret) != "")
+
+@test
+fn test_plain_is_preferred_on_tls_and_refused_without_it() [io]
+    // Not an order of strength: CRAM-MD5 never sends the password, but
+    // it requires the server to store something it can compute HMAC
+    // from — which is worse than anything it protects against once the
+    // connection is encrypted.
+    test.case("on TLS, PLAIN")
+    match smtpauth.best_mechanism(["CRAM-MD5", "PLAIN", "LOGIN"], true)
+        None    => test.assert(false)
+        Some(m) =>
+            match m
+                SmtpAuthPlain => test.assert(true)
+                _             => test.assert(false)
+
+    test.case("without TLS, CRAM-MD5")
+    match smtpauth.best_mechanism(["CRAM-MD5", "PLAIN", "LOGIN"], false)
+        None    => test.assert(false)
+        Some(m) =>
+            match m
+                SmtpAuthCramMd5 => test.assert(true)
+                _               => test.assert(false)
+
+    test.case("and without TLS and without CRAM-MD5, nothing at all")
+    match smtpauth.best_mechanism(["PLAIN", "LOGIN"], false)
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+@test
+fn test_only_cram_md5_keeps_the_password_off_the_wire() [io]
+    test.assert(smtpauth.is_safe_without_tls(SmtpAuthCramMd5))
+    test.assert(not smtpauth.is_safe_without_tls(SmtpAuthPlain))
+    test.assert(not smtpauth.is_safe_without_tls(SmtpAuthLogin))
+
+@test
+fn test_plain_has_an_initial_response_and_the_others_do_not() [io]
+    // PLAIN saves a round trip; CRAM-MD5 cannot have one, because it
+    // would be answering a challenge it invented.
+    match smtpauth.initial_response(smtpauth.begin(SmtpAuthPlain, "tim", []))
+        None    => test.assert(false)
+        Some(_) => test.assert(true)
+
+    match smtpauth.initial_response(smtpauth.begin(SmtpAuthCramMd5, "tim", []))
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+@test
+fn test_a_mechanism_name_round_trips_case_insensitively() [io]
+    test.assert(smtpauth.mechanism_name(SmtpAuthCramMd5) == "CRAM-MD5")
+
+    match smtpauth.mechanism_of("cram-md5")
+        None    => test.assert(false)
+        Some(_) => test.assert(true)
+
+    match smtpauth.mechanism_of("XOAUTH2")
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+@test
+fn test_an_exchange_ends_and_says_so() [io]
+    let a = smtpauth.begin(SmtpAuthLogin, "tim", [])
+
+    test.case("a fresh exchange is not done")
+    test.assert(not smtpauth.is_done(a))
+
+    test.case("and a prompt advances it")
+    match smtpauth.answer(a, "")
+        Err(_)   => test.assert(false)
+        Ok(turn) => test.assert(turn.state.step > a.step)

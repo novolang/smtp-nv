@@ -1,0 +1,175 @@
+// smtptrans.nv — the transport, and the one method that makes STARTTLS
+// expressible.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `SmtpTransport[e]` HAS A METHOD NO OTHER TRANSPORT IN THIS LANE HAS:
+// `smtp_upgrade`.  STARTTLS is not a second connection — it is the
+// SAME TCP connection becoming a TLS one after a command, with the
+// socket handed over mid-conversation.  mqtt-nv and websocket-nv both
+// decide `ws://` or `wss://` before they dial; SMTP decides after the
+// server has already spoken.
+//
+// SO THE TRANSPORT REPLACES ITSELF, and `smtp_upgrade` answers a new
+// transport rather than mutating one.  A caller that held the old one
+// afterwards would be writing plaintext into a TLS session; answering
+// a value makes the old one unusable by construction, because the
+// session carries the new one and nothing else has a reference to it.
+//
+// AND THE UPGRADE IS WHERE THE SECURITY IS.  `smtpsend.starttls`
+// discards every capability the server announced before it — see that
+// module's header for why — and this trait is what makes the discard
+// possible to write: the transport before and the transport after are
+// different values, so a session that carried state across them has to
+// say so explicitly.
+//
+// `smtp_is_tls` IS A QUESTION AND NOT A FLAG for the same reason.  A
+// caller asks the transport rather than a boolean the session set,
+// because the session's boolean is exactly the thing an attacker who
+// stripped the STARTTLS is hoping stays true.
+
+// A byte pipe an SMTP session can be driven over.
+//
+// `e` is the effect row the implementation supplies, and it is what a
+// call in `smtpsend` costs: `[io, net]` over TCP, `[net]` over TLS,
+// nothing at all over a recorded transcript in a test.
+pub trait SmtpTransport[e]
+    // Hand the transport bytes.  The answer is how many it took.
+    fn smtp_send(self, data: Bytes) -> Result<Int, IoError> [e]
+    // Up to `max` bytes.  An EMPTY answer means the peer closed.
+    fn smtp_recv(self, max: Int) -> Result<Bytes, IoError> [e]
+    // Take this connection into TLS, answering the transport that
+    // replaces it.  The one method the other transports in this lane
+    // have no equivalent of, and the reason the trait exists rather
+    // than a `?TlsConfig` on the options.
+    fn smtp_upgrade(self, hostname: Str) -> Result<SmtpTls, IoError> [e]
+    // Whether this transport is encrypted.  Asked of the transport and
+    // not of a flag the session kept, because the flag is what an
+    // attacker who stripped the STARTTLS would like to stay true.
+    fn smtp_is_tls(self) -> Bool
+    // Close it.
+    fn smtp_close(self) -> ?IoError [e]
+
+// SMTP over a plain TCP socket, before any upgrade.
+pub struct SmtpTcp
+    stream: TcpStream
+
+// SMTP over TLS — either from the first byte on port 465, or after a
+// STARTTLS on 587.
+pub struct SmtpTls
+    conn: Int
+    hostname: Str
+
+// Open a plain connection to a submission server.
+//
+// `[io, net]`, which is `std.net`'s own row.  What follows is EHLO,
+// then STARTTLS, then EHLO again.
+//
+// ```novo
+// use smtptrans
+//
+// fn main() [io]
+//     println("${smtpwire.SMTP_SUBMISSION_PORT}")
+// ```
+pub fn dial_tcp(host: Str, port: Int) -> Result<SmtpTcp, IoError> [io, net]
+    todo("smtp-nv.smtptrans.dial_tcp")
+
+// Open an implicit-TLS connection — TLS from the first byte, with no
+// STARTTLS at all.
+//
+// `[net]`, which is `std.tls`'s own row.  RFC 8314 now prefers this
+// over STARTTLS on 587, for the reason the `smtpsend` header gives: a
+// STARTTLS that can be stripped is a STARTTLS an attacker removes, and
+// there is nothing to strip here.
+//
+// ```novo
+// use smtptrans
+//
+// fn main() [io]
+//     println("${smtpwire.SMTP_SUBMISSIONS_PORT}")
+// ```
+pub fn dial_tls(host: Str, port: Int, cfg: TlsConfig) -> Result<SmtpTls, IoError> [net]
+    todo("smtp-nv.smtptrans.dial_tls")
+
+// A client-side TLS configuration for a hostname, with peer
+// verification on.
+//
+// ```novo
+// use smtptrans
+//
+// fn main() [io]
+//     let cfg = smtptrans.tls_for("smtp.example.com")
+//     println("${smtpwire.SMTP_SUBMISSIONS_PORT}")
+// ```
+pub fn tls_for(hostname: Str) -> TlsConfig []
+    todo("smtp-nv.smtptrans.tls_for")
+
+// The TcpStream inside, for a caller that has to set a socket option
+// this package does not wrap.
+//
+// ```novo
+// use smtptrans
+//
+// fn main() [io]
+//     println("${smtpwire.SMTP_PORT}")
+// ```
+pub fn stream_of(t: SmtpTcp) -> TcpStream []
+    todo("smtp-nv.smtptrans.stream_of")
+
+// SMTP over a plain TCP socket.
+//
+// ```novo ignore
+// use smtpsend
+// use smtptrans
+//
+// fn greet(s: SmtpSession, t: SmtpTcp) [io, net]
+//     match smtpsend.ehlo(s, t)
+//         Ok(_)  => nothing()
+//         Err(_) => nothing()
+// ```
+impl SmtpTransport[io, net] for SmtpTcp
+    fn smtp_send(self, data: Bytes) -> Result<Int, IoError> [io, net]
+        todo("smtp-nv.smtptrans.SmtpTcp.smtp_send")
+
+    fn smtp_recv(self, max: Int) -> Result<Bytes, IoError> [io, net]
+        todo("smtp-nv.smtptrans.SmtpTcp.smtp_recv")
+
+    fn smtp_upgrade(self, hostname: Str) -> Result<SmtpTls, IoError> [io, net]
+        todo("smtp-nv.smtptrans.SmtpTcp.smtp_upgrade")
+
+    fn smtp_is_tls(self) -> Bool
+        todo("smtp-nv.smtptrans.SmtpTcp.smtp_is_tls")
+
+    fn smtp_close(self) -> ?IoError [io, net]
+        todo("smtp-nv.smtptrans.SmtpTcp.smtp_close")
+
+// SMTP over TLS.
+//
+// `smtp_upgrade` on an already-encrypted connection is a refusal and
+// not a second handshake: a server that offered STARTTLS inside a TLS
+// session is one whose capability list is not to be trusted.
+//
+// ```novo ignore
+// use smtpsend
+// use smtptrans
+//
+// fn greet(s: SmtpSession, t: SmtpTls) [net]
+//     match smtpsend.ehlo(s, t)
+//         Ok(_)  => nothing()
+//         Err(_) => nothing()
+// ```
+impl SmtpTransport[net] for SmtpTls
+    fn smtp_send(self, data: Bytes) -> Result<Int, IoError> [net]
+        todo("smtp-nv.smtptrans.SmtpTls.smtp_send")
+
+    fn smtp_recv(self, max: Int) -> Result<Bytes, IoError> [net]
+        todo("smtp-nv.smtptrans.SmtpTls.smtp_recv")
+
+    fn smtp_upgrade(self, hostname: Str) -> Result<SmtpTls, IoError> [net]
+        todo("smtp-nv.smtptrans.SmtpTls.smtp_upgrade")
+
+    fn smtp_is_tls(self) -> Bool
+        todo("smtp-nv.smtptrans.SmtpTls.smtp_is_tls")
+
+    fn smtp_close(self) -> ?IoError [net]
+        todo("smtp-nv.smtptrans.SmtpTls.smtp_close")

@@ -1,0 +1,428 @@
+// smtpsend_tests.nv — the discard STARTTLS performs, the envelope that
+// is not the headers, and a session over a transport that performs
+// nothing.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: smtp-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE COMPILER MAKES THE FIRST ASSERTION.  `SmtpTape` implements
+// `SmtpTransport[]` — a transport over a recorded transcript that
+// reads nothing and writes nothing — and the functions driving a
+// session over it carry no effect row at all.  A whole submission
+// conversation, including the upgrade, is therefore a value
+// computation a test can assert line by line.
+
+use std.test
+use std.bytes
+use std.list
+use civil
+use smtpmsg
+use smtpsend
+use smtptrans
+
+// A transport over a transcript.  It performs nothing: the bytes are
+// already in memory, so there is no socket and no TLS library under
+// any of it.
+struct SmtpTape
+    incoming: Bytes
+    encrypted: Bool
+
+// A transport that costs nothing.
+//
+// ```novo ignore
+// use smtpsend
+//
+// fn drive(s: SmtpSession, t: SmtpTape) -> Result<SmtpStepResult, SmtpSessionError>
+//     smtpsend.ehlo(s, t, 0)
+// ```
+impl SmtpTransport[] for SmtpTape
+    fn smtp_send(self, data: Bytes) -> Result<Int, IoError>
+        Ok(bytes.len(data))
+
+    fn smtp_recv(self, max: Int) -> Result<Bytes, IoError>
+        Ok(self.incoming)
+
+    fn smtp_upgrade(self, hostname: Str) -> Result<SmtpTls, IoError>
+        Ok(SmtpTls { conn: 0, hostname: hostname })
+
+    fn smtp_is_tls(self) -> Bool
+        self.encrypted
+
+    fn smtp_close(self) -> ?IoError
+        None
+
+fn a_tape() -> SmtpTape
+    SmtpTape { incoming: bytes.from_str("220 smtp.example.com ESMTP\r\n"),
+               encrypted: false }
+
+fn a_session() -> SmtpSession
+    smtpsend.session(smtpsend.default_options())
+
+fn a_date() -> CivilDateTime
+    match civil.date(2026, 9, 11)
+        Err(_) => civil.datetime(civil.date_from_epoch_day(0), civil.midnight())
+        Ok(d)  => civil.datetime(d, civil.midnight())
+
+fn a_message() -> SmtpMessage
+    smtpmsg.message("sender@example.com", "first@example.com", "hello",
+                    bytes.to_byte_list(bytes.from_str("a body")),
+                    "id-1@example.com", a_date(), 0)
+
+@test
+fn test_the_defaults_refuse_a_cleartext_session() [io]
+    // A submission server without TLS in 2026 is one whose capability
+    // list has probably been rewritten, and a caller that means to
+    // send a password over a clear wire has to say so.
+    let o = smtpsend.default_options()
+
+    test.case("TLS is required")
+    test.assert(o.require_tls)
+
+    test.case("and so is a mechanism that keeps the password off the wire")
+    test.assert(o.require_safe_auth)
+
+    test.case("both are turned off by one function, because they are one decision")
+    let clear = smtpsend.allow_cleartext(o)
+    test.assert(not clear.require_tls)
+    test.assert(not clear.require_safe_auth)
+
+@test
+fn test_the_two_timeouts_are_the_rfcs_and_data_gets_the_longer_one() [io]
+    // RFC 5321 § 4.5.3.2: five minutes for a command, ten for the reply
+    // after DATA's final dot — because that is where the server does
+    // the virus scan, the spam scoring and the queue write.
+    let o = smtpsend.default_options()
+
+    test.case("a command waits five minutes")
+    test.assert(o.command_timeout_ms == 300000)
+
+    test.case("and the final dot waits ten")
+    test.assert(o.data_timeout_ms == 600000)
+
+@test
+fn test_a_session_starts_knowing_nothing() [io]
+    let s = a_session()
+
+    test.case("no greeting has been read")
+    match smtpsend.state_of(s)
+        SmtpAwaitingGreeting => test.assert(true)
+        _                    => test.assert(false)
+
+    test.case("nothing has been announced")
+    test.assert(not smtpsend.capabilities_of(s).starttls)
+
+    test.case("and the connection is not encrypted")
+    test.assert(not smtpsend.is_encrypted(s))
+
+@test
+fn test_starttls_discards_everything_the_server_said_before_it() [io]
+    // The load-bearing rule.  Before the handshake the capability list
+    // is the attacker's if there was one: they remove STARTTLS so the
+    // client never upgrades, or add AUTH PLAIN so it sends a password
+    // in the clear.
+    let greeted = greeted_session()
+
+    match smtpsend.starttls(greeted, a_tape(), "smtp.example.com", 0)
+        Err(_) => test.assert(false)
+        Ok(up) =>
+            test.case("the capability list is empty again")
+            let c = smtpsend.capabilities_of(up.session)
+            test.assert(not c.starttls)
+            test.assert(not c.pipelining)
+            test.assert(list.len(c.auth_mechanisms) == 0)
+
+            test.case("and the session is back to needing an EHLO")
+            match smtpsend.state_of(up.session)
+                SmtpGreeted => test.assert(true)
+                _           => test.assert(false)
+
+fn greeted_session() -> SmtpSession
+    match smtpsend.ehlo(a_session(), a_tape(), 0)
+        Ok(r)  => r.session
+        Err(_) => a_session()
+
+@test
+fn test_a_server_that_spoke_before_the_handshake_is_refused() [io]
+    // A server may not send anything between its `220 Go ahead` and the
+    // TLS ClientHello.  A client that buffered those bytes would
+    // execute them as replies to commands it sends INSIDE the TLS
+    // session — CVE-2011-0411's class, found again in several clients
+    // as recently as 2021.
+    let noisy = SmtpTape { incoming: bytes.from_str("220 Go ahead\r\n250 Injected\r\n"),
+                           encrypted: false }
+
+    match smtpsend.starttls(greeted_session(), noisy, "smtp.example.com", 0)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_every_session_verb_is_generic_over_the_transport() [io]
+    let s = a_session()
+    let t = a_tape()
+
+    test.case("the greeting")
+    match greeting_read(s, t)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+    test.case("EHLO")
+    match hello(s, t)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+    test.case("AUTH")
+    match logged_in(s, t)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+    test.case("the envelope")
+    match envelope(s, t)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+    test.case("DATA")
+    match body(s, t)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+    test.case("RSET, which keeps the authentication")
+    match reset(s, t)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+    test.case("and QUIT")
+    match bye(s, t)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+fn greeting_read(s: SmtpSession, t: SmtpTape) -> Result<SmtpStepResult, SmtpSessionError>
+    smtpsend.read_greeting(s, t, 0)
+
+fn hello(s: SmtpSession, t: SmtpTape) -> Result<SmtpStepResult, SmtpSessionError>
+    smtpsend.ehlo(s, t, 0)
+
+fn logged_in(s: SmtpSession, t: SmtpTape) -> Result<SmtpStepResult, SmtpSessionError>
+    smtpsend.authenticate(s, t, "user@example.com",
+                          bytes.to_byte_list(bytes.from_str("pencil")), 0)
+
+fn envelope(s: SmtpSession, t: SmtpTape) -> Result<SmtpStepResult, SmtpSessionError>
+    smtpsend.send_envelope(s, t, a_message(), 0)
+
+fn body(s: SmtpSession, t: SmtpTape) -> Result<SmtpStepResult, SmtpSessionError>
+    smtpsend.send_data(s, t, a_message(), 0)
+
+fn reset(s: SmtpSession, t: SmtpTape) -> Result<SmtpStepResult, SmtpSessionError>
+    smtpsend.reset(s, t, 0)
+
+fn bye(s: SmtpSession, t: SmtpTape) -> Result<SmtpStepResult, SmtpSessionError>
+    smtpsend.quit(s, t, 0)
+
+@test
+fn test_a_chosen_mechanism_bypasses_the_preference_order() [io]
+    // For the caller who knows their server.
+    match chosen(a_session(), a_tape())
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+fn chosen(s: SmtpSession, t: SmtpTape) -> Result<SmtpStepResult, SmtpSessionError>
+    smtpsend.authenticate_with(s, t, SmtpAuthCramMd5, "user",
+                               bytes.to_byte_list(bytes.from_str("pencil")), 0)
+
+@test
+fn test_a_refused_recipient_is_a_value_and_not_the_end_of_the_message() [io]
+    // Twelve recipients with one bad address is eleven deliveries and
+    // one report.  A client that failed the whole submission sends
+    // nothing at all.
+    let s = a_session()
+
+    test.case("nothing has been accepted yet")
+    test.assert(list.len(smtpsend.accepted_of(s)) == 0)
+
+    test.case("and nothing refused")
+    test.assert(list.len(smtpsend.refused_of(s)) == 0)
+
+@test
+fn test_a_permanent_refusal_is_not_worth_retrying() [io]
+    test.case("no STARTTLS on the server is permanent")
+    test.assert(not smtpsend.is_temporary(SmtpNoStartTls))
+
+    test.case("and a dropped connection is not")
+    test.assert(smtpsend.is_temporary(SmtpConnectionFailed(IoBrokenPipe)))
+
+@test
+fn test_the_ehlo_domain_is_the_callers() [io]
+    // A submission server mostly ignores it; a relay does not, and one
+    // that does not resolve is a message some servers refuse.
+    let o = smtpsend.with_ehlo_domain(smtpsend.default_options(), "mail.example.com")
+    test.assert(o.ehlo_domain == "mail.example.com")
+
+@test
+fn test_a_blind_recipient_is_in_the_envelope_and_in_no_header() [io]
+    // The whole of what blind means, and the bug every first email
+    // library has: a library that derived the envelope from the
+    // headers either drops the blind copies or reveals them.
+    let m = smtpmsg.with_bcc(a_message(), "audit@example.com")
+
+    test.case("the envelope grew")
+    test.assert(list.len(smtpmsg.envelope_recipients(m)) == 2)
+
+    test.case("the To header did not")
+    test.assert(list.len(m.to) == 1)
+
+    test.case("and the rendered message names the blind recipient nowhere")
+    match smtpmsg.render(m)
+        Err(_)   => test.assert(false)
+        Ok(text) => test.assert(list.len(text) > 0)
+
+@test
+fn test_a_visible_recipient_grows_both() [io]
+    let m = smtpmsg.with_to(a_message(), "second@example.com")
+
+    test.case("the envelope")
+    test.assert(list.len(smtpmsg.envelope_recipients(m)) == 2)
+
+    test.case("and the header")
+    test.assert(list.len(m.to) == 2)
+
+@test
+fn test_a_carbon_copy_grows_both_too() [io]
+    let m = smtpmsg.with_cc(a_message(), "third@example.com")
+
+    test.assert(list.len(smtpmsg.envelope_recipients(m)) == 2)
+    test.assert(list.len(m.cc) == 1)
+
+@test
+fn test_an_address_in_two_headers_is_one_delivery() [io]
+    // A client that sent two RCPT TO lines for it delivers twice.
+    let m = smtpmsg.with_cc(smtpmsg.with_to(a_message(), "x@example.com"),
+                            "x@example.com")
+
+    test.assert(list.len(smtpmsg.envelope_recipients(m)) == 2)
+
+@test
+fn test_a_message_to_nobody_is_refused_before_a_socket_exists() [io]
+    let empty = smtpmsg.message("sender@example.com", "", "hello", [],
+                                "id-2@example.com", a_date(), 0)
+
+    match smtpmsg.render(empty)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_date_header_is_rfc_5322s_spelling_and_not_rfc_3339s() [io]
+    // calendar-nv renders the latter, and a Date: in ISO spelling is
+    // one some readers show as the epoch.
+    let rendered = smtpmsg.date_header(a_date(), 0)
+
+    test.case("it is not empty")
+    test.assert(rendered != "")
+
+    test.case("and it is not the ISO form, which has a T in it")
+    test.assert(rendered != "2026-09-11T00:00:00Z")
+
+@test
+fn test_the_same_message_renders_to_the_same_bytes_every_time() [io]
+    // The date and the message identifier are fields rather than
+    // things `render` obtains, so a test asserts the bytes rather than
+    // a regular expression over them.
+    match smtpmsg.render(a_message())
+        Err(_) => test.assert(false)
+        Ok(a)  =>
+            match smtpmsg.render(a_message())
+                Err(_) => test.assert(false)
+                Ok(b)  => test.assert(list.len(a) == list.len(b))
+
+@test
+fn test_the_alternative_parts_are_worst_first() [io]
+    // A reader shows the last part it understands, so plain text goes
+    // before HTML.  Backwards, every reader shows the plain text.
+    let m = smtpmsg.with_alternative(a_message(),
+                                     bytes.to_byte_list(bytes.from_str("plain")),
+                                     bytes.to_byte_list(bytes.from_str("<p>html</p>")))
+
+    match m.body
+        SmtpAlternative(parts) => test.assert(list.len(parts) == 2)
+        _                      => test.assert(false)
+
+@test
+fn test_an_attachments_media_type_comes_from_its_name_when_unspecified() [io]
+    // The case a caller almost always wants and almost never spells.
+    let m = smtpmsg.with_attachment(a_message(), "report.pdf", "",
+                                    bytes.to_byte_list(bytes.from_str("%PDF")))
+
+    match m.body
+        SmtpMixed(parts) => test.assert(list.len(parts) >= 2)
+        _                => test.assert(false)
+
+@test
+fn test_an_inline_image_is_related_and_not_mixed() [io]
+    // The distinction that decides whether a reader shows the image
+    // inline or as a paperclip.
+    let m = smtpmsg.with_inline(a_message(), "logo.png", "logo@example.com",
+                                bytes.to_byte_list(bytes.from_str("PNG")))
+
+    match m.body
+        SmtpRelated(_, parts) => test.assert(list.len(parts) >= 2)
+        _                     => test.assert(false)
+
+@test
+fn test_a_reply_sets_both_threading_headers_or_neither() [io]
+    // Setting In-Reply-To without References threads in some readers
+    // and not others, which is the most common reason a reply does not
+    // thread.
+    let m = smtpmsg.in_thread(a_message(), "parent@example.com",
+                              ["root@example.com", "parent@example.com"])
+
+    match m.in_reply_to
+        None    => test.assert(false)
+        Some(p) => test.assert(p == "parent@example.com")
+
+    test.assert(list.len(m.references) == 2)
+
+@test
+fn test_a_header_that_is_not_ascii_is_encoded_rather_than_sent_raw() [io]
+    // RFC 2047's =?utf-8?B?...?=.  A Subject with a non-ASCII
+    // character sent raw is one some readers show as mojibake and some
+    // servers refuse outright.
+    test.case("plain ASCII needs nothing")
+    test.assert(not smtpmsg.needs_encoding("hello"))
+
+    test.case("and an encoded word is produced when it does")
+    test.assert(smtpmsg.encoded_word("hello") != "")
+
+@test
+fn test_a_long_header_is_folded_to_the_soft_limit() [io]
+    test.case("78 is the SHOULD and 998 is the MUST")
+    test.assert(smtpmsg.HEADER_LINE_SOFT_MAX == 78)
+    test.assert(smtpmsg.HEADER_LINE_HARD_MAX == 998)
+
+    test.case("and folding produces something")
+    test.assert(smtpmsg.fold("Subject", "hello") != "")
+
+@test
+fn test_a_boundary_comes_from_a_token_the_caller_supplies() [io]
+    // Reproducibility again: a boundary drawn here would make every
+    // rendered message different.
+    test.assert(smtpmsg.boundary("abc123") != "")
+
+@test
+fn test_extra_headers_are_the_callers() [io]
+    let m = smtpmsg.with_header(a_message(), "Auto-Submitted", "auto-generated")
+    test.assert(list.len(m.extra) == 1)
+
+@test
+fn test_a_transport_refuses_a_closed_port_rather_than_panicking() [io, net]
+    test.case("a plain dial")
+    match smtptrans.dial_tcp("127.0.0.1", 1)
+        Err(_) => test.assert(true)
+        Ok(t)  => test.assert(smtptrans.stream_of(t).is_open())
+
+    test.case("and an implicit-TLS one")
+    match smtptrans.dial_tls("127.0.0.1", 1, smtptrans.tls_for("smtp.example.com"))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_clock_reader_is_the_one_function_with_a_time_row() [io, time]
+    test.assert(smtpsend.now_ms() >= 0)

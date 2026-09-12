@@ -1,0 +1,513 @@
+// smtpsend.nv — the session: EHLO, STARTTLS, AUTH, the envelope, DATA.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// **EVERYTHING THE SERVER SAID BEFORE STARTTLS IS DISCARDED.**  That
+// is the load-bearing rule of this module and the reason the session
+// is a value rather than a connection with fields.  Before the TLS
+// handshake, every byte the server sent arrived over a wire an
+// attacker in the middle was writing on, so the capability list is the
+// attacker's list: they can remove `STARTTLS` so the client never
+// upgrades, add an `AUTH PLAIN` a real server never offered so the
+// client sends a password in the clear, or shrink `SIZE` so a message
+// is refused.  `starttls` therefore resets the session to
+// `smtpwire.no_capabilities()` and REQUIRES a second EHLO, and
+// `capabilities_of` answers the post-upgrade list and no other.
+//
+// AND THE OTHER HALF OF THE SAME ATTACK IS COMMAND INJECTION.  A
+// server may not send anything between its `220 Go ahead` and the TLS
+// ClientHello, because a client that had buffered those bytes would
+// execute them as replies to commands it sends INSIDE the TLS session
+// — which is CVE-2011-0411 and its descendants, and which was found
+// again in several clients in 2021.  `starttls` discards the read
+// buffer along with the capabilities, and `SmtpPipelinedAfterStartTls`
+// is what a server that sent anything gets.
+//
+// THE CLOCK IS AN ARGUMENT, as in the other three packages: a
+// submission session has two timeouts that matter — RFC 5321 § 4.5.3.2
+// gives DATA's final `.` a ten-minute budget and everything else five
+// — and both become tables rather than integration runs.  `now_ms` is
+// the one function here that reads a clock.
+//
+// PIPELINING IS OFF UNLESS THE SERVER OFFERED IT, and the grouping is
+// `smtpwire.may_pipeline`'s rather than this module's: `MAIL FROM` and
+// every `RCPT TO` go out together and the replies are read in order,
+// which turns a twelve-recipient message from thirteen round trips
+// into two.  `DATA` is a barrier and so is every AUTH exchange.
+
+use smtpwire
+
+// Where a session is.
+pub enum SmtpSessionState
+    // Connected; the server's greeting has not been read.
+    SmtpAwaitingGreeting
+    // The greeting arrived and no EHLO has been sent.
+    SmtpGreeted
+    // EHLO answered; the capability list is what `capabilities_of`
+    // holds.
+    SmtpReady
+    // The connection is encrypted and a second EHLO has been answered.
+    SmtpSecured
+    // AUTH succeeded.
+    SmtpAuthenticated
+    // A transaction is open: MAIL FROM has been accepted.
+    SmtpInTransaction
+    // DATA was accepted and the body is going out.
+    SmtpSendingData
+    // QUIT was sent.
+    SmtpClosed
+
+// What a caller decides before a session exists.
+pub struct SmtpSessionOptions
+    // The domain this client names in EHLO.  A submission server
+    // mostly ignores it; a relay does not, and one that does not
+    // resolve is a message some servers refuse.
+    ehlo_domain: Str
+    // Refuse to continue on a connection that is not encrypted after
+    // STARTTLS was attempted.  True, and a caller that means to send a
+    // password over a cleartext wire has to say so.
+    require_tls: Bool
+    // Refuse to authenticate with a mechanism `smtpauth` calls unsafe
+    // on a cleartext connection.  True, and for the same reason.
+    require_safe_auth: Bool
+    // Use PIPELINING when the server offers it.
+    pipelining: Bool
+    // RFC 5321 § 4.5.3.2's timeouts, in milliseconds: five minutes for
+    // an ordinary command, ten for the final `.` of a DATA — because
+    // that is where the server does the work.
+    command_timeout_ms: Int
+    data_timeout_ms: Int
+    // The reader's limits.
+    max_line: Int
+    max_reply_lines: Int
+
+// One submission session.
+pub struct SmtpSession
+    state: SmtpSessionState
+    options: SmtpSessionOptions
+    // The wire reader.
+    reader: SmtpReader
+    // What the server announced — AFTER the upgrade, when there was
+    // one.  Reset to `smtpwire.no_capabilities()` by `starttls`.
+    capabilities: SmtpCapabilities
+    // Whether the transport is encrypted, as the TRANSPORT last
+    // answered it.  A copy for reporting; `smtp_is_tls` is what
+    // decisions are made on.
+    tls: Bool
+    // Recipients accepted so far in the open transaction, and the ones
+    // refused with the reply that refused them.
+    accepted: [Str]
+    refused: [SmtpRefusal]
+
+// One recipient the server would not take.
+//
+// A value and not an error, because a message to twelve people where
+// one address is wrong is eleven deliveries and one report — and a
+// client that failed the whole submission sends nothing at all.
+pub struct SmtpRefusal
+    recipient: Str
+    code: Int
+    enhanced: Str
+    text: Str
+
+// What a step of the session taught the caller.
+pub enum SmtpSessionEvent
+    SmtpGreetingRead(greeting: Str)
+    SmtpCapabilitiesRead(caps: SmtpCapabilities)
+    // The connection became encrypted, and everything the server said
+    // before this moment has been discarded.
+    SmtpUpgraded
+    SmtpAuthenticatedAs(username: Str)
+    SmtpSenderAccepted(address: Str)
+    SmtpRecipientAccepted(address: Str)
+    // One recipient was refused and the transaction continues.
+    SmtpRecipientRefused(refusal: SmtpRefusal)
+    // The server accepted the message.  The text is what it said, and
+    // it usually carries the queue identifier a support request will
+    // need.
+    SmtpMessageAccepted(queue_reply: Str)
+
+// A session step: the session after it, and what happened.
+pub struct SmtpStepResult
+    session: SmtpSession
+    events: [SmtpSessionEvent]
+
+// The default options: an EHLO domain of `localhost`, TLS required,
+// safe authentication required, pipelining on, and RFC 5321's
+// timeouts.
+//
+// ```novo
+// use smtpsend
+//
+// fn main() [io]
+//     println("${smtpsend.default_options().require_tls}")
+// ```
+pub fn default_options() -> SmtpSessionOptions []
+    todo("smtp-nv.smtpsend.default_options")
+
+// The EHLO domain this client names.
+//
+// ```novo
+// use smtpsend
+//
+// fn main() [io]
+//     let o = smtpsend.with_ehlo_domain(smtpsend.default_options(), "mail.example.com")
+//     println(o.ehlo_domain)
+// ```
+pub fn with_ehlo_domain(o: SmtpSessionOptions, domain: Str) -> SmtpSessionOptions []
+    todo("smtp-nv.smtpsend.with_ehlo_domain")
+
+// Allow a cleartext connection, and a mechanism that sends the
+// password over one.
+//
+// One function for both, because they are one decision and a caller
+// that turned off only the first has a session that will not
+// authenticate anyway.  It exists for the two cases that are real: a
+// local relay on the loopback interface, and a test.
+//
+// ```novo
+// use smtpsend
+//
+// fn main() [io]
+//     let o = smtpsend.allow_cleartext(smtpsend.default_options())
+//     println("${o.require_tls}")
+// ```
+pub fn allow_cleartext(o: SmtpSessionOptions) -> SmtpSessionOptions []
+    todo("smtp-nv.smtpsend.allow_cleartext")
+
+// A session that has not yet read the server's greeting.
+//
+// ```novo
+// use smtpsend
+//
+// fn main() [io]
+//     let s = smtpsend.session(smtpsend.default_options())
+//     println("${s.tls}")
+// ```
+pub fn session(o: SmtpSessionOptions) -> SmtpSession []
+    todo("smtp-nv.smtpsend.session")
+
+// Where the session is.
+//
+// ```novo
+// use smtpsend
+//
+// fn main() [io]
+//     match smtpsend.state_of(smtpsend.session(smtpsend.default_options()))
+//         SmtpAwaitingGreeting => println("nothing read yet")
+//         _                    => println("further on")
+// ```
+pub fn state_of(s: SmtpSession) -> SmtpSessionState []
+    todo("smtp-nv.smtpsend.state_of")
+
+// What the server announced — after the upgrade, when there was one.
+//
+// The one accessor, and it never answers the pre-STARTTLS list,
+// because that list was the attacker's if there was one.
+//
+// ```novo
+// use smtpsend
+//
+// fn main() [io]
+//     let c = smtpsend.capabilities_of(smtpsend.session(smtpsend.default_options()))
+//     println("${c.starttls}")
+// ```
+pub fn capabilities_of(s: SmtpSession) -> SmtpCapabilities []
+    todo("smtp-nv.smtpsend.capabilities_of")
+
+// A monotonic millisecond reading.
+//
+// The one function in this package that reads a clock, and the only
+// `[time]` row in it.
+//
+// ```novo
+// use smtpsend
+//
+// fn main() [io, time]
+//     println("${smtpsend.now_ms() >= 0}")
+// ```
+pub fn now_ms() -> Int [time]
+    todo("smtp-nv.smtpsend.now_ms")
+
+// Read the server's opening greeting.
+//
+// A `220` and nothing else.  A `554` here is a server refusing the
+// connection outright — a blocklisted address, usually — and it is the
+// one reply that arrives before the client has said anything at all.
+//
+// ```novo ignore
+// use smtpsend
+// use smtptrans
+//
+// fn open(s: SmtpSession, t: SmtpTcp, now: Int) -> Result<SmtpStepResult, SmtpSessionError> [io, net]
+//     smtpsend.read_greeting(s, t, now)
+// ```
+pub fn read_greeting<T: SmtpTransport[e]>(s: SmtpSession, t: T,
+                                          now_ms: Int) -> Result<SmtpStepResult, SmtpSessionError> [e]
+    todo("smtp-nv.smtpsend.read_greeting")
+
+// Send EHLO and read the capability list.
+//
+// Called twice on a STARTTLS session — once before and once after —
+// and the second answer is the only one that counts.
+//
+// ```novo ignore
+// use smtpsend
+// use smtptrans
+//
+// fn hello(s: SmtpSession, t: SmtpTcp, now: Int) -> Result<SmtpStepResult, SmtpSessionError> [io, net]
+//     smtpsend.ehlo(s, t, now)
+// ```
+pub fn ehlo<T: SmtpTransport[e]>(s: SmtpSession, t: T,
+                                 now_ms: Int) -> Result<SmtpStepResult, SmtpSessionError> [e]
+    todo("smtp-nv.smtpsend.ehlo")
+
+// Send STARTTLS, upgrade the transport, and **discard everything the
+// server said before it**.
+//
+// Three things happen and all three are the security property:
+//
+// - the capability list is reset to `smtpwire.no_capabilities()`, so
+//   the pre-upgrade list — which was the attacker's if there was one —
+//   cannot be read afterwards;
+// - the read buffer is discarded, and a server that had sent anything
+//   between its `220` and the handshake gets
+//   `SmtpPipelinedAfterStartTls` rather than having those bytes
+//   executed as replies inside the TLS session;
+// - and the session moves to `SmtpGreeted`, so the next thing that may
+//   be sent is EHLO.
+//
+// It answers the new transport beside the session, because the old one
+// is now writing plaintext into a TLS connection and must not be used
+// again.
+//
+// ```novo ignore
+// use smtpsend
+// use smtptrans
+//
+// fn secure(s: SmtpSession, t: SmtpTcp, now: Int) -> Result<SmtpUpgrade, SmtpSessionError> [io, net]
+//     smtpsend.starttls(s, t, "smtp.example.com", now)
+// ```
+pub fn starttls<T: SmtpTransport[e]>(s: SmtpSession, t: T, hostname: Str,
+                                     now_ms: Int) -> Result<SmtpUpgrade, SmtpSessionError> [e]
+    todo("smtp-nv.smtpsend.starttls")
+
+// A session that has been upgraded, and the transport that replaced
+// the old one.
+pub struct SmtpUpgrade
+    session: SmtpSession
+    transport: SmtpTls
+
+// Authenticate, choosing a mechanism from what the server offered.
+//
+// Refuses rather than downgrading: on a cleartext connection with
+// `require_safe_auth` set, a server offering only PLAIN and LOGIN gets
+// `SmtpNoSafeMechanism` and the password stays on this machine.
+//
+// ```novo ignore
+// use smtpsend
+// use smtptrans
+//
+// fn login(s: SmtpSession, t: SmtpTls, now: Int) -> Result<SmtpStepResult, SmtpSessionError> [net]
+//     smtpsend.authenticate(s, t, "user@example.com", [], now)
+// ```
+pub fn authenticate<T: SmtpTransport[e]>(s: SmtpSession, t: T, username: Str, secret: [u8],
+                                         now_ms: Int) -> Result<SmtpStepResult, SmtpSessionError> [e]
+    todo("smtp-nv.smtpsend.authenticate")
+
+// Authenticate with a mechanism the caller chose.
+//
+// For the caller who knows their server and does not want the
+// preference order applied.
+//
+// ```novo ignore
+// use smtpauth
+// use smtpsend
+// use smtptrans
+//
+// fn login(s: SmtpSession, t: SmtpTls, now: Int) -> Result<SmtpStepResult, SmtpSessionError> [net]
+//     smtpsend.authenticate_with(s, t, SmtpAuthCramMd5, "user", [], now)
+// ```
+pub fn authenticate_with<T: SmtpTransport[e]>(s: SmtpSession, t: T, m: SmtpMechanism, username: Str,
+                                              secret: [u8],
+                                              now_ms: Int) -> Result<SmtpStepResult, SmtpSessionError> [e]
+    todo("smtp-nv.smtpsend.authenticate_with")
+
+// Send the envelope: `MAIL FROM` and one `RCPT TO` per recipient,
+// pipelined where the server offered it.
+//
+// A recipient the server refuses is an event and not an error, so a
+// message to twelve people with one wrong address is eleven deliveries
+// and one report.  `SmtpNoRecipientAccepted` is the error, and it
+// arrives only when every one of them was refused.
+//
+// ```novo ignore
+// use smtpsend
+// use smtptrans
+//
+// fn envelope(s: SmtpSession, t: SmtpTls, m: SmtpMessage, now: Int) -> Result<SmtpStepResult, SmtpSessionError> [net]
+//     smtpsend.send_envelope(s, t, m, now)
+// ```
+pub fn send_envelope<T: SmtpTransport[e]>(s: SmtpSession, t: T, m: SmtpMessage,
+                                          now_ms: Int) -> Result<SmtpStepResult, SmtpSessionError> [e]
+    todo("smtp-nv.smtpsend.send_envelope")
+
+// Send `DATA`, the rendered message with its dots stuffed, and the
+// terminator.
+//
+// The ten-minute timeout applies to the reply after the final `.`,
+// not to the body: that is where the server does the work — the virus
+// scan, the spam scoring, the queue write — and a client that used the
+// five-minute budget gives up on messages that were about to be
+// accepted.
+//
+// ```novo ignore
+// use smtpsend
+// use smtptrans
+//
+// fn body(s: SmtpSession, t: SmtpTls, m: SmtpMessage, now: Int) -> Result<SmtpStepResult, SmtpSessionError> [net]
+//     smtpsend.send_data(s, t, m, now)
+// ```
+pub fn send_data<T: SmtpTransport[e]>(s: SmtpSession, t: T, m: SmtpMessage,
+                                      now_ms: Int) -> Result<SmtpStepResult, SmtpSessionError> [e]
+    todo("smtp-nv.smtpsend.send_data")
+
+// Abandon the open transaction and keep the session.
+//
+// What a client does after a refused recipient it will not send
+// without, and the reason it is not a reconnection: `RSET` keeps the
+// authentication, so the next message costs one command rather than a
+// TLS handshake and an AUTH.
+//
+// ```novo ignore
+// use smtpsend
+// use smtptrans
+//
+// fn reset(s: SmtpSession, t: SmtpTls, now: Int) -> Result<SmtpStepResult, SmtpSessionError> [net]
+//     smtpsend.reset(s, t, now)
+// ```
+pub fn reset<T: SmtpTransport[e]>(s: SmtpSession, t: T,
+                                  now_ms: Int) -> Result<SmtpStepResult, SmtpSessionError> [e]
+    todo("smtp-nv.smtpsend.reset")
+
+// Send `QUIT` and close.
+//
+// A session dropped without QUIT is one some servers log as an abort
+// and some rate-limiters count against the address.
+//
+// ```novo ignore
+// use smtpsend
+// use smtptrans
+//
+// fn bye(s: SmtpSession, t: SmtpTls, now: Int) -> Result<SmtpStepResult, SmtpSessionError> [net]
+//     smtpsend.quit(s, t, now)
+// ```
+pub fn quit<T: SmtpTransport[e]>(s: SmtpSession, t: T,
+                                 now_ms: Int) -> Result<SmtpStepResult, SmtpSessionError> [e]
+    todo("smtp-nv.smtpsend.quit")
+
+// The recipients the server accepted in the open transaction.
+//
+// ```novo
+// use smtpsend
+// use std.list
+//
+// fn main() [io]
+//     let n = list.len(smtpsend.accepted_of(smtpsend.session(smtpsend.default_options())))
+//     println("${n}")
+// ```
+pub fn accepted_of(s: SmtpSession) -> [Str] []
+    todo("smtp-nv.smtpsend.accepted_of")
+
+// The recipients it refused, with the reply that refused each.
+//
+// What a caller reports to a person, and the reason a refusal is a
+// value: the enhanced status code says whether the address does not
+// exist or the mailbox is full, and those are different messages to
+// show.
+//
+// ```novo
+// use smtpsend
+// use std.list
+//
+// fn main() [io]
+//     let n = list.len(smtpsend.refused_of(smtpsend.session(smtpsend.default_options())))
+//     println("${n}")
+// ```
+pub fn refused_of(s: SmtpSession) -> [SmtpRefusal] []
+    todo("smtp-nv.smtpsend.refused_of")
+
+// Whether the transport under this session is encrypted.
+//
+// ```novo
+// use smtpsend
+//
+// fn main() [io]
+//     println("${smtpsend.is_encrypted(smtpsend.session(smtpsend.default_options()))}")
+// ```
+pub fn is_encrypted(s: SmtpSession) -> Bool []
+    todo("smtp-nv.smtpsend.is_encrypted")
+
+// Why a session could not continue.
+pub enum SmtpSessionError
+    SmtpConnectionFailed(cause: IoError)
+    // The wire codec refused what arrived.
+    SmtpWireRefused(cause: SmtpWireError)
+    // The message could not be rendered.
+    SmtpMessageRefused(cause: SmtpMessageError)
+    // An AUTH exchange failed.
+    SmtpAuthFailed(cause: SmtpAuthError)
+    // The server answered a command with a code the session cannot
+    // proceed from.  The whole reply, because the text is the only
+    // part that says why.
+    SmtpUnexpectedReply(command: Str, code: Int, enhanced: Str, text: Str)
+    // `require_tls` is set and the server did not offer STARTTLS.  A
+    // refusal and not a downgrade: a submission server without TLS in
+    // 2026 is one whose capability list has probably been rewritten.
+    SmtpNoStartTls
+    // **The server sent bytes between its `220 Go ahead` and the TLS
+    // handshake.**  A client that buffered them would execute them as
+    // replies inside the TLS session; this is that injection, caught.
+    SmtpPipelinedAfterStartTls(bytes_waiting: Int)
+    // `require_safe_auth` is set, the connection is cleartext, and the
+    // server offered no mechanism that keeps the password off the
+    // wire.
+    SmtpNoSafeMechanism(offered: [Str])
+    // Every recipient was refused.  The refusals are on the session.
+    SmtpNoRecipientAccepted
+    // The message is larger than the `SIZE` the server announced —
+    // measured after dot-stuffing, which is what actually travels.
+    SmtpMessageTooLarge(size: Int, limit: Int)
+    // A command's reply did not arrive inside its budget.
+    SmtpTimedOut(command: Str, waited_ms: Int)
+    // A command issued in a state that does not allow it.
+    SmtpWrongState(command: Str, state: Str)
+
+// The one-line reading, for a log or a person.
+//
+// ```novo
+// use smtpsend
+//
+// fn main() [io]
+//     let e: SmtpSessionError = SmtpNoStartTls
+//     println(e.message())
+// ```
+impl Error for SmtpSessionError
+    fn message(self) -> Str
+        todo("smtp-nv.smtpsend.SessionError.message")
+
+// True when this failure is worth trying again later.
+//
+// A 4yz and a dropped connection; a 5yz and every refusal this package
+// makes itself are permanent.  A client that retried a 550 sends the
+// same rejection until somebody stops it, and one that gave up on a
+// 451 loses mail that would have gone through in a minute.
+//
+// ```novo
+// use smtpsend
+//
+// fn main() [io]
+//     println("${smtpsend.is_temporary(SmtpNoStartTls)}")
+// ```
+pub fn is_temporary(e: SmtpSessionError) -> Bool []
+    todo("smtp-nv.smtpsend.is_temporary")

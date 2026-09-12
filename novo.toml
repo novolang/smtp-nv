@@ -1,0 +1,67 @@
+[package]
+name        = "smtp-nv"
+version     = "0.0.1"
+description = "SMTP submission (RFC 6409): EHLO and the capability list, STARTTLS as a transport that replaces itself, AUTH PLAIN, LOGIN and CRAM-MD5, the envelope and DATA with dot-stuffing, pipelining, and an RFC 5322 message builder with MIME multipart bodies.  The command and reply codec is a sans-IO module of this package.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `host`, and MOST OF THE PACKAGE DECLARES NOTHING.  `smtpwire` is the
+# command and reply codec and every row in it is `[]`; so are
+# `smtpauth`'s mechanisms and `smtpmsg`'s message builder.  What
+# performs is `smtptrans` — `[io, net]` for TCP through `std.net`,
+# `[net]` for TLS through `std.tls` — and the session functions in
+# `smtpsend`, which are effect-polymorphic over `SmtpTransport[e]` and
+# cost whatever the caller's transport costs.
+#
+# `layer = "host"` AND NOT `layer = "core"` WITH `host_modules`.  The
+# manifest can declare the narrower layer and name the wider modules,
+# and that shape is for a package whose SUBJECT is the pure half — a
+# matcher with a directory walker beside it.  This package's subject is
+# submitting a message over a socket; the codec is there because a
+# session needs one, not the other way round.  Declaring `core` would
+# have advertised a `core` package that no `core` consumer wants.
+layer       = "host"
+
+category    = "networking"
+
+tags        = ["smtp", "email", "submission", "rfc5322", "mime", "starttls", "auth"]
+repository  = "https://github.com/novolang/smtp-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Handing a message to a submission server"
+
+[dependencies]
+# Media types for the body parts: `MimeType`, the parser, and the
+# extension table a file attachment's type is looked up in.  `core`, so
+# `dep-layer` holds.
+mime-nv = "^0.0.1"
+
+# base64, which SMTP needs in three different places — the AUTH
+# exchange, `Content-Transfer-Encoding: base64` on an attachment, and
+# the encoded-word form of a header with a non-ASCII character in it.
+base64-nv = "^0.0.1"
+
+# HMAC-MD5, for CRAM-MD5 and nothing else.  MD5 is broken for every
+# purpose that depends on collisions being hard and this is not one of
+# them: the value proves the client knows a shared secret it never
+# sends, against a challenge the server chose.  It is included because
+# a submission server that offers only CRAM-MD5 is a submission server
+# a client without it cannot use, and those still exist.
+crypto-nv = "^0.1"
+
+# Civil dates, for the `Date:` header.  RFC 5322 § 3.3's spelling —
+# `Tue, 1 Jul 2003 10:52:37 +0200` — is not RFC 3339's, so the
+# rendering is in `smtpmsg` and what comes from here is the arithmetic
+# under it: `CivilDateTime`, the weekday, and the month.
+calendar-nv = "^0.0.2"

@@ -1,0 +1,393 @@
+// smtpmsg.nv — the message itself: RFC 5322 headers and a MIME body.
+// Every row here is `[]`.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE ENVELOPE IS NOT THE HEADERS, AND CONFLATING THEM IS THE BUG
+// EVERY FIRST EMAIL LIBRARY HAS.  `MAIL FROM` and `RCPT TO` are what
+// the server routes on; `From:`, `To:` and `Cc:` are text inside the
+// message that nothing routes on at all.  A `Bcc:` recipient is in the
+// envelope and NOT in the headers — that is the whole of what blind
+// means — and a library that derived the envelope from the headers
+// either drops the blind copies or reveals them.  So `SmtpMessage`
+// carries both, `envelope_recipients` answers the first and
+// `render` writes the second, and `Bcc` appears in exactly one of them.
+//
+// A DATE AND A MESSAGE-ID ARE ARGUMENTS.  Both are what a `core`
+// package would have had to take as parameters — a clock and
+// randomness — and this module takes them for the same reason one
+// layer up: a rendered message becomes byte-for-byte reproducible, so
+// a test asserts the bytes rather than a regular expression over them.
+// `smtpsend` is where a caller who wants "now" gets it.
+//
+// AND A HEADER VALUE IS CHECKED BEFORE IT IS WRITTEN.  A CR or LF in a
+// subject line ends the header and begins another one the caller never
+// wrote, which is how a web form's "your name" field becomes a `Bcc:`.
+// `header_fault` is that check and `render` calls it, so the injected
+// header cannot be built whatever the calling program believed.
+
+use civil
+
+// One header field.
+pub struct SmtpHeader
+    name: Str
+    value: Str
+
+// A message body: one part, or several.
+pub enum SmtpBody
+    // One part with a media type.  `text/plain; charset=utf-8` for the
+    // ordinary case.
+    SmtpPart(content_type: Str, content: [u8])
+    // `multipart/alternative` — the SAME message in several forms,
+    // worst first, and a reader shows the last one it understands.
+    // Plain text then HTML, in that order, and getting the order
+    // backwards means every reader shows the plain text.
+    SmtpAlternative(parts: [SmtpBody])
+    // `multipart/mixed` — DIFFERENT things: a body and its
+    // attachments.
+    SmtpMixed(parts: [SmtpBody])
+    // `multipart/related` — a body and the images its HTML refers to
+    // by `cid:`.
+    SmtpRelated(root_cid: Str, parts: [SmtpBody])
+    // A part with a filename and a disposition.
+    SmtpAttachment(content_type: Str, filename: Str, inline_cid: ?Str, content: [u8])
+
+// A whole message: the envelope, the headers and the body.
+pub struct SmtpMessage
+    // THE ENVELOPE.  What the server routes on.
+    envelope_from: Str
+    envelope_to: [Str]
+    // THE HEADERS.  Text inside the message.
+    from: Str
+    to: [Str]
+    cc: [Str]
+    // Not a field.  Blind recipients are in `envelope_to` and in no
+    // header at all, which is what blind means; a `bcc` field here
+    // would be a field somebody eventually renders.
+    reply_to: ?Str
+    subject: Str
+    // RFC 5322 § 3.6.4's `Message-ID`, without the angle brackets.
+    message_id: Str
+    // When the message was composed, as a civil date-time and a
+    // UTC offset in minutes.  An argument, so a rendered message is
+    // reproducible.
+    date: CivilDateTime
+    date_offset_minutes: Int
+    // `In-Reply-To` and `References`, without angle brackets — the two
+    // headers a thread is built from, and the two every client that
+    // breaks threading forgets.
+    in_reply_to: ?Str
+    references: [Str]
+    // Anything else: `Auto-Submitted`, `List-Unsubscribe`, a tracking
+    // header.
+    extra: [SmtpHeader]
+    body: SmtpBody
+
+// The longest a header line may be before it is folded, 78 characters.
+//
+// RFC 5322 § 2.1.1's SHOULD.  The MUST is 998, and the difference
+// matters: 78 is what a human-readable message wants and 998 is what a
+// conforming one requires.
+pub const HEADER_LINE_SOFT_MAX = 78
+
+// The hard limit, 998 characters, CRLF excluded.
+pub const HEADER_LINE_HARD_MAX = 998
+
+// A minimal message: one sender, one recipient, a subject and a plain
+// text body, with the envelope derived from the headers.
+//
+// Derived is right HERE and wrong in general: with no `Bcc` the
+// envelope IS the headers, and this constructor is for the case where
+// there is none.  `with_bcc` is what breaks the equality, and it takes
+// the envelope apart rather than adding a header.
+//
+// ```novo
+// use smtpmsg
+// use civil
+//
+// fn main() [io]
+//     match civil.date(2026, 9, 11)
+//         Err(_) => println("bad date")
+//         Ok(d)  =>
+//             let dt = civil.datetime(d, civil.midnight())
+//             let m = smtpmsg.message("a@example.com", "b@example.com",
+//                                     "hello", [], "id-1", dt, 0)
+//             println(m.subject)
+// ```
+pub fn message(from: Str, to: Str, subject: Str, text: [u8], message_id: Str, date: CivilDateTime,
+               offset_minutes: Int) -> SmtpMessage []
+    todo("smtp-nv.smtpmsg.message")
+
+// Add a blind recipient: the envelope grows and no header changes.
+//
+// The one function whose whole purpose is that it does NOT touch a
+// header, which is why it exists rather than a `bcc` field.
+//
+// ```novo ignore
+// use smtpmsg
+//
+// fn blind(m: SmtpMessage) -> SmtpMessage
+//     smtpmsg.with_bcc(m, "audit@example.com")
+// ```
+pub fn with_bcc(m: SmtpMessage, address: Str) -> SmtpMessage []
+    todo("smtp-nv.smtpmsg.with_bcc")
+
+// Add a visible recipient: the envelope and the `To:` header both
+// grow.
+//
+// ```novo ignore
+// use smtpmsg
+//
+// fn also(m: SmtpMessage) -> SmtpMessage
+//     smtpmsg.with_to(m, "c@example.com")
+// ```
+pub fn with_to(m: SmtpMessage, address: Str) -> SmtpMessage []
+    todo("smtp-nv.smtpmsg.with_to")
+
+// Add a carbon copy: the envelope and the `Cc:` header both grow.
+//
+// ```novo ignore
+// use smtpmsg
+//
+// fn copy(m: SmtpMessage) -> SmtpMessage
+//     smtpmsg.with_cc(m, "d@example.com")
+// ```
+pub fn with_cc(m: SmtpMessage, address: Str) -> SmtpMessage []
+    todo("smtp-nv.smtpmsg.with_cc")
+
+// A plain-text and an HTML rendering of the same message.
+//
+// `multipart/alternative` with the plain text FIRST, because a reader
+// shows the last part it understands and the order is the preference.
+// Backwards, every reader shows the plain text.
+//
+// ```novo ignore
+// use smtpmsg
+//
+// fn both(m: SmtpMessage, text: [u8], html: [u8]) -> SmtpMessage
+//     smtpmsg.with_alternative(m, text, html)
+// ```
+pub fn with_alternative(m: SmtpMessage, text: [u8], html: [u8]) -> SmtpMessage []
+    todo("smtp-nv.smtpmsg.with_alternative")
+
+// Attach a file.
+//
+// The media type is looked up from the filename through mime-nv's
+// extension table when `content_type` is empty, which is the case a
+// caller almost always wants and almost never spells.
+//
+// ```novo ignore
+// use smtpmsg
+//
+// fn attach(m: SmtpMessage, data: [u8]) -> SmtpMessage
+//     smtpmsg.with_attachment(m, "report.pdf", "", data)
+// ```
+pub fn with_attachment(m: SmtpMessage, filename: Str, content_type: Str,
+                       content: [u8]) -> SmtpMessage []
+    todo("smtp-nv.smtpmsg.with_attachment")
+
+// Attach an image the HTML part refers to by `cid:`.
+//
+// `multipart/related` rather than `multipart/mixed`, which is the
+// distinction that decides whether a reader shows the image inline or
+// as a paperclip.
+//
+// ```novo ignore
+// use smtpmsg
+//
+// fn inline_image(m: SmtpMessage, data: [u8]) -> SmtpMessage
+//     smtpmsg.with_inline(m, "logo.png", "logo@example.com", data)
+// ```
+pub fn with_inline(m: SmtpMessage, filename: Str, cid: Str, content: [u8]) -> SmtpMessage []
+    todo("smtp-nv.smtpmsg.with_inline")
+
+// Set the thread this message belongs to.
+//
+// Both headers together, because setting one without the other is the
+// most common reason a reply does not thread: `In-Reply-To` is the
+// parent and `References` is the whole ancestry, and a client that
+// sent only the first threads in some readers and not others.
+//
+// ```novo ignore
+// use smtpmsg
+//
+// fn reply(m: SmtpMessage, parent: Str, ancestry: [Str]) -> SmtpMessage
+//     smtpmsg.in_thread(m, parent, ancestry)
+// ```
+pub fn in_thread(m: SmtpMessage, parent_id: Str, ancestry: [Str]) -> SmtpMessage []
+    todo("smtp-nv.smtpmsg.in_thread")
+
+// Add a header field of the caller's own.
+//
+// ```novo ignore
+// use smtpmsg
+//
+// fn tagged(m: SmtpMessage) -> SmtpMessage
+//     smtpmsg.with_header(m, "Auto-Submitted", "auto-generated")
+// ```
+pub fn with_header(m: SmtpMessage, name: Str, value: Str) -> SmtpMessage []
+    todo("smtp-nv.smtpmsg.with_header")
+
+// The whole message as bytes, headers and body, with CRLF line
+// endings.
+//
+// What follows a `DATA`, before `smtpwire.data_body` stuffs its dots.
+// Reproducible: the same message renders to the same bytes every time,
+// because the date and the message identifier are fields rather than
+// things this function obtains.
+//
+// ```novo ignore
+// use smtpmsg
+//
+// fn bytes_of(m: SmtpMessage) -> Result<[u8], SmtpMessageError>
+//     smtpmsg.render(m)
+// ```
+pub fn render(m: SmtpMessage) -> Result<[u8], SmtpMessageError> []
+    todo("smtp-nv.smtpmsg.render")
+
+// Every address the envelope carries: `To`, `Cc` and the blind
+// recipients, deduplicated.
+//
+// What `RCPT TO` is issued for, once each.  A message to an address
+// that is both a `To` and a `Cc` is one delivery, and a client that
+// sent two `RCPT TO` lines for it delivers twice.
+//
+// ```novo ignore
+// use smtpmsg
+//
+// fn who(m: SmtpMessage) -> [Str]
+//     smtpmsg.envelope_recipients(m)
+// ```
+pub fn envelope_recipients(m: SmtpMessage) -> [Str] []
+    todo("smtp-nv.smtpmsg.envelope_recipients")
+
+// RFC 5322 § 3.3's date: `Tue, 1 Jul 2003 10:52:37 +0200`.
+//
+// Not RFC 3339's, which is what calendar-nv renders and what a caller
+// reaching for `iso8601.format_rfc3339` would get: the day name, the
+// abbreviated month and the offset with no colon are all different,
+// and a `Date:` in ISO spelling is one some readers show as the epoch.
+//
+// ```novo
+// use smtpmsg
+// use civil
+//
+// fn main() [io]
+//     match civil.date(2026, 9, 11)
+//         Err(_) => println("bad date")
+//         Ok(d)  =>
+//             let dt = civil.datetime(d, civil.midnight())
+//             println(smtpmsg.date_header(dt, 0))
+// ```
+pub fn date_header(dt: CivilDateTime, offset_minutes: Int) -> Str []
+    todo("smtp-nv.smtpmsg.date_header")
+
+// A header value's encoded-word form, for one that is not ASCII.
+//
+// RFC 2047's `=?utf-8?B?...?=`.  A `Subject:` with a non-ASCII
+// character sent raw is a subject some readers show as mojibake and
+// some servers refuse outright, and the encoding is per-word with a
+// 75-character limit per encoded word — which is the part a naive
+// implementation skips.
+//
+// ```novo
+// use smtpmsg
+//
+// fn main() [io]
+//     println(smtpmsg.encoded_word("hello"))
+// ```
+pub fn encoded_word(value: Str) -> Str []
+    todo("smtp-nv.smtpmsg.encoded_word")
+
+// True when a header value needs encoding: it has a byte above 127, or
+// it is longer than the soft limit.
+//
+// ```novo
+// use smtpmsg
+//
+// fn main() [io]
+//     println("${smtpmsg.needs_encoding("hello")}")
+// ```
+pub fn needs_encoding(value: Str) -> Bool []
+    todo("smtp-nv.smtpmsg.needs_encoding")
+
+// Why a header value may not be written, or `None`.
+//
+// **The injection defence.**  A CR or an LF in a value ends the header
+// and begins another one the caller never wrote — which is how a web
+// form's "your name" field becomes a `Bcc:`.  `render` calls this, so
+// the injected header cannot be built whatever the calling program
+// believed.
+//
+// ```novo
+// use smtpmsg
+//
+// fn main() [io]
+//     match smtpmsg.header_fault("Subject", "hello")
+//         Some(_) => println("refused")
+//         None    => println("fine")
+// ```
+pub fn header_fault(name: Str, value: Str) -> ?SmtpMessageError []
+    todo("smtp-nv.smtpmsg.header_fault")
+
+// A header line folded to the soft limit, with continuation lines
+// indented.
+//
+// ```novo
+// use smtpmsg
+//
+// fn main() [io]
+//     println(smtpmsg.fold("Subject", "hello"))
+// ```
+pub fn fold(name: Str, value: Str) -> Str []
+    todo("smtp-nv.smtpmsg.fold")
+
+// A MIME boundary for a multipart body, from a caller-supplied token.
+//
+// The token is an argument rather than drawn here for the reason the
+// date is a field: a rendered message has to be reproducible.  The
+// boundary must not occur inside any part, which is what `render`
+// checks — a boundary that did would end a part early, and the rest of
+// the attachment would be read as headers.
+//
+// ```novo
+// use smtpmsg
+//
+// fn main() [io]
+//     println(smtpmsg.boundary("abc123"))
+// ```
+pub fn boundary(token: Str) -> Str []
+    todo("smtp-nv.smtpmsg.boundary")
+
+// Why a message could not be rendered.
+pub enum SmtpMessageError
+    // A CR or LF in a header value.  The injection case.
+    SmtpNewlineInHeader(name: Str)
+    // A header name that is not a valid field name.
+    SmtpBadHeaderName(name: Str)
+    // An address with no `@`, or with a control character in it.
+    SmtpBadAddress(address: Str)
+    // No recipients at all: a message the server would accept and
+    // deliver to nobody.
+    SmtpNoRecipients
+    // A multipart boundary that occurs inside one of the parts, which
+    // would end that part early.
+    SmtpBoundaryCollides(token: Str)
+    // A content type mime-nv refused.
+    SmtpBadContentType(cause: MimeError)
+    // A header line past the 998-character hard limit that folding
+    // could not break — a single unbroken token.
+    SmtpHeaderUnfoldable(name: Str, len: Int)
+
+// The one-line reading, for a log or a person.
+//
+// ```novo
+// use smtpmsg
+//
+// fn main() [io]
+//     let e: SmtpMessageError = SmtpNoRecipients
+//     println(e.message())
+// ```
+impl Error for SmtpMessageError
+    fn message(self) -> Str
+        todo("smtp-nv.smtpmsg.MessageError.message")
