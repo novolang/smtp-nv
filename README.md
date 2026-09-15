@@ -1,279 +1,356 @@
 # smtp-nv
 
-**Status: NOT IMPLEMENTED — interface only.**
+Message submission is the act of handing a message you composed to the
+server that will deliver it. The commands and replies are the Simple
+Mail Transfer Protocol, specified in
+[RFC 5321](https://www.rfc-editor.org/rfc/rfc5321); the restrictions a
+submission server places on them are
+[RFC 6409](https://www.rfc-editor.org/rfc/rfc6409); the message itself
+is [RFC 5322](https://www.rfc-editor.org/rfc/rfc5322). This package
+brings all three to novo-lang, for a program that sends its own mail.
+It builds on four packages on the registry:
+[mime-nv](https://novo-lang.org/packages/mime-nv) for the media types,
+[base64-nv](https://novo-lang.org/packages/base64-nv) for the three
+places SMTP needs base64,
+[crypto-nv](https://novo-lang.org/packages/crypto-nv) for HMAC-MD5, and
+[calendar-nv](https://novo-lang.org/packages/calendar-nv) for the date
+arithmetic. [dkim-nv](https://novo-lang.org/packages/dkim-nv) signs a
+message this package sends.
 
-Every public function below is published with its signature and its
-effect row, and every body is `todo()`.  Installing this package works;
-calling it panics with `not implemented`.
+**Status: NOT IMPLEMENTED — interface only.** Every function is declared
+with its full signature, but every body is a `todo()` that panics when
+called. The package is published so its design can be reviewed and
+depended on before it is implemented. Version 0.1.0 will be the first
+working release.
 
-## What this is
+## What message submission is
 
-SMTP submission (RFC 6409): handing a message you composed to the
-server that will deliver it.  EHLO and the capability list, STARTTLS,
-AUTH PLAIN / LOGIN / CRAM-MD5, the envelope, DATA with its dots
-stuffed, pipelining, and an RFC 5322 message builder with MIME
-multipart bodies.
+A mail transfer agent (MTA) is a server that accepts a message and
+passes it on. Submission is the first hop: a program hands its own
+message to one MTA, which authenticates the program and takes
+responsibility for the rest. Relay is every hop after that, and this
+package does not do it. RFC 6409 section 1 draws the line.
 
-It is not a mail server, not a relay and not a mail reader.  It is what
-a program that needs to send its own mail uses, on port 587 or 465,
-against a server that will ask it who it is.
+The conversation is lines of text. The client sends a command and the
+server answers with a **reply**, which is a three-digit code and some
+text. A reply may run to several lines. `250-SIZE` continues and
+`250 SIZE` ends, and the difference is one character in column four.
+RFC 5321 section 4.2.1 defines both, and it also fixes what the first
+digit means.
 
-## Adding it, and checking it
+| First digit | Meaning | What a client does |
+| --- | --- | --- |
+| 2 | Accepted | Send the next command |
+| 3 | Send more | Send the body, or the next authentication line |
+| 4 | Temporary failure | Try the same thing later |
+| 5 | Permanent failure | Do not try the same thing again |
 
-```bash
-novo pkg add smtp-nv        # into your novo.toml
-novo pkg build              # type- and effect-check the package
-novo test --isolate tests/smtpwire_tests.nv
+The client opens with **EHLO**, which names the client and asks what the
+server can do. The server answers with its **capability list**: the
+extensions it supports, one per line. `STARTTLS` offers encryption,
+`AUTH` lists the authentication mechanisms, `SIZE` gives a byte limit,
+and `PIPELINING` permits several commands to be sent without waiting
+for each reply. RFC 5321 section 4.1.1.1 defines EHLO.
+
+Three ports carry SMTP, and they are not interchangeable.
+
+| Port | What it carries | Reference |
+| --- | --- | --- |
+| 587 | Submission, encrypted by STARTTLS after the first EHLO | RFC 6409 section 3.1 |
+| 465 | Submission, encrypted from the first byte | RFC 8314 section 3.3 |
+| 25 | Relay between servers, with no authentication | RFC 5321 section 2.3.4 |
+
+The **envelope** is `MAIL FROM` and one `RCPT TO` per recipient. It is
+what the server routes on. The **headers** are `From:`, `To:` and `Cc:`,
+which are text inside the message that nothing routes on at all. A blind
+recipient is in the envelope and in no header, which is the whole of
+what blind means. RFC 5321 section 2.3.1 keeps the two apart.
+
+The body follows a `DATA` command and ends with a line holding one dot.
+A line of the message that already begins with a dot therefore has a
+second dot put in front of it, which is called **dot-stuffing**. RFC
+5321 section 4.5.2 defines it. The sizes below are the limits every
+implementation is held to.
+
+| Limit | Value | Reference |
+| --- | --- | --- |
+| A command line | 512 bytes | RFC 5321 section 4.5.3.1.4 |
+| Any line, CRLF included | 1000 bytes | RFC 5321 section 4.5.3.1.6 |
+| A header line, recommended | 78 characters | RFC 5322 section 2.1.1 |
+| A header line, maximum | 998 characters | RFC 5322 section 2.1.1 |
+| Waiting for an ordinary reply | 5 minutes | RFC 5321 section 4.5.3.2 |
+| Waiting for the reply after the final dot | 10 minutes | RFC 5321 section 4.5.3.2 |
+
+Three authentication mechanisms are implemented, and they differ in what
+travels over the connection.
+
+| Mechanism | Reference | What travels |
+| --- | --- | --- |
+| PLAIN | RFC 4616 | The password, in base64, in one line |
+| LOGIN | No standard; an expired draft | The password, in base64, after two prompts |
+| CRAM-MD5 | RFC 2195 | An HMAC-MD5 of a challenge the server chose |
+
+## Install
+
+```
+novo pkg add smtp-nv
 ```
 
-`novo test` is red today and that is the point of the release: every
-assertion fails with `not implemented: smtp-nv.<module>.<fn>`.  They
-turn green one at a time as bodies land.
-
-## The one example that will work
+## Example
 
 ```novo
+use civil
 use smtpmsg
 use smtpsend
 use smtptrans
 use smtpwire
 
-// Submit one message over STARTTLS.  The second EHLO is not optional
-// and the section below says why.
-fn submit(host: Str, m: SmtpMessage) -> Result<Unit, SmtpSessionError> [io, net, time]
-    let tcp = smtptrans.dial_tcp(host, smtpwire.SMTP_SUBMISSION_PORT)!
+// Submit one message on port 587, upgrading the connection to TLS.
+fn submit(host: Str, user: Str, secret: [u8],
+          m: SmtpMessage) -> Result<Unit, SmtpSessionError> [io, net, time]
+    // Open a plain connection and read the server's 220 greeting.
+    let tcp: SmtpTcp = match smtptrans.dial_tcp(host, smtpwire.SMTP_SUBMISSION_PORT)
+        Ok(t)  => t
+        Err(e) => return Err(SmtpConnectionFailed(e))
     var s = smtpsend.session(smtpsend.default_options())
-
     s = smtpsend.read_greeting(s, tcp, smtpsend.now_ms())!.session
+
+    // The first EHLO. Its capability list is discarded at the upgrade.
     s = smtpsend.ehlo(s, tcp, smtpsend.now_ms())!.session
 
-    // Everything the server said above this line is now discarded.
-    let up = smtpsend.starttls(s, tcp, host, smtpsend.now_ms())!
-    let tls = up.transport
-    s = smtpsend.ehlo(up.session, tls, smtpsend.now_ms())!.session
+    // STARTTLS. It answers the transport that replaces the plain one.
+    let up: SmtpUpgrade = smtpsend.starttls(s, tcp, host, smtpsend.now_ms())!
+    let tls: SmtpTls = up.transport
 
-    s = smtpsend.authenticate(s, tls, "user@example.com", secret(), smtpsend.now_ms())!.session
+    // The second EHLO, over TLS. This capability list is the one that counts.
+    s = smtpsend.ehlo(up.session, tls, smtpsend.now_ms())!.session
+    s = smtpsend.authenticate(s, tls, user, secret, smtpsend.now_ms())!.session
+
+    // MAIL FROM and one RCPT TO per recipient, then DATA and the body.
     s = smtpsend.send_envelope(s, tls, m, smtpsend.now_ms())!.session
     s = smtpsend.send_data(s, tls, m, smtpsend.now_ms())!.session
     let _ = smtpsend.quit(s, tls, smtpsend.now_ms())!
     Ok()
+
+fn main() [io, net, time]
+    match civil.date(2026, 9, 15)
+        Err(_) => println("not a date")
+        Ok(d)  =>
+            // The date and the message identifier are arguments, so the
+            // same message renders to the same bytes every time.
+            let when = civil.datetime(d, civil.midnight())
+            let m = smtpmsg.message("alice@example.com", "bob@example.net",
+                                    "hello", [], "id-1@example.com", when, 0)
+            match submit("smtp.example.com", "alice@example.com", [], m)
+                Ok(_)  => println("the server accepted the message")
+                Err(e) => println(e.message())
 ```
 
-## The layer, and why
+Build and test with `novo pkg build` and `novo test`. Today `novo test`
+fails on purpose: every test reaches a
+`not implemented: smtp-nv.<module>.<fn>` panic. The tests are the
+specification the implementation will have to satisfy.
 
-`host`, and most of the package declares nothing.
+## What the package contains
 
-| module | row | why |
-| --- | --- | --- |
-| `smtpwire` | `[]` throughout | the command and reply codec; sans-IO by construction |
-| `smtpauth` | `[]` throughout | a mechanism is a function from a challenge to a response |
-| `smtpmsg` | `[]` throughout | a message is a value, and rendering it is arithmetic |
-| `smtptrans.dial_tcp` | `[io, net]` | `std.net`'s own row |
-| `smtptrans.dial_tls` | `[net]` | `std.tls`'s own row, which is narrower |
-| `smtpsend.now_ms` | `[time]` | the one function in the package that reads a clock |
-| every session function in `smtpsend` | `[e]` | effect-POLYMORPHIC: whatever the transport costs |
-
-`layer = "host"` and **not** `layer = "core"` with `host_modules`.  The
-manifest can declare the narrower layer and name the wider modules, and
-that shape is for a package whose *subject* is the pure half — a
-matcher with a directory walker beside it.  This package's subject is
-submitting a message over a socket; the codec is there because a
-session needs one.
-
-## The load-bearing interface
-
-**Everything the server said before STARTTLS is discarded**, and
-`smtpsend.starttls` is where that happens.
-
-Before the TLS handshake, every byte the server sent arrived over a
-wire an attacker in the middle was writing on.  So the capability list
-is the *attacker's* list, and three things follow from treating it as
-the server's:
-
-- they remove `STARTTLS`, the client sees a server that cannot
-  encrypt, and the whole session is in the clear;
-- they add `AUTH PLAIN` a real server never offered, and the client
-  sends a password in base64 over that clear wire;
-- they shrink `SIZE`, and a message that would have gone through is
-  refused.
-
-So `starttls` resets the session to `smtpwire.no_capabilities()`, moves
-it back to `SmtpGreeted`, and requires a second EHLO.
-`smtpsend.capabilities_of` answers the post-upgrade list and no other
-— there is no accessor for the earlier one, because there is no correct
-use for it.
-
-The same function handles the other half of the same attack.  A server
-may not send anything between its `220 Go ahead` and the TLS
-ClientHello; a client that had buffered those bytes would execute them
-as replies to commands it sends **inside** the TLS session.  That is
-CVE-2011-0411 and its descendants, found again in several clients as
-recently as 2021.  `starttls` discards the read buffer along with the
-capabilities, and a server that sent anything gets
-`SmtpPipelinedAfterStartTls` rather than having its bytes obeyed.
-
-The second decision is `SmtpTransport[e]`, and it carries a method no
-other transport in this cohort has: **`smtp_upgrade`**.  STARTTLS is
-not a second connection — it is the same TCP connection becoming a TLS
-one after a command. mqtt-nv and websocket-nv decide `ws://` or `wss://`
-before they dial; SMTP decides after the server has already spoken.  So
-`smtp_upgrade` answers a *new* transport rather than mutating one, and
-a caller that held the old one afterwards would be writing plaintext
-into a TLS session — which the type system now makes awkward rather
-than silent.
-
-## The envelope is not the headers
-
-`MAIL FROM` and `RCPT TO` are what the server routes on; `From:`,
-`To:` and `Cc:` are text inside the message that nothing routes on at
-all.  A blind recipient is in the envelope and in **no header** — that
-is the whole of what blind means — and a library that derived the
-envelope from the headers either drops the blind copies or reveals
-them.
-
-So `SmtpMessage` carries both, `with_bcc` grows the envelope and
-touches no header, and `envelope_recipients` is what `RCPT TO` is
-issued for — deduplicated, because an address that is both a `To` and a
-`Cc` is one delivery.
-
-## The date and the message identifier are arguments
-
-Both are what a `core` package would have had to take as parameters — a
-clock and randomness — and this package takes them for the same reason
-one layer up: a rendered message becomes byte-for-byte reproducible, so
-a test asserts the bytes rather than a regular expression over them.
-`smtpsend` is where a caller who wants "now" gets it.
-
-The `Date:` header is RFC 5322 § 3.3's spelling — `Tue, 1 Jul 2003
-10:52:37 +0200` — and not RFC 3339's.  calendar-nv renders the latter,
-and a `Date:` in ISO spelling is one some readers show as the epoch, so
-the rendering is `smtpmsg.date_header`'s and what comes from calendar-nv
-is the arithmetic under it.
-
-## Injection, in two places
-
-A CR or LF in a header value ends the header and begins another one the
-caller never wrote — which is how a web form's "your name" field
-becomes a `Bcc:`.  `smtpmsg.header_fault` is that check and `render`
-calls it, so the injected header cannot be built.
-
-The same character in a command argument ends the command, which is how
-the same bug becomes an open relay.  `smtpwire.encode` refuses with
-`SmtpControlCharacterInArgument`.
-
-Both are refusals inside the encoder rather than rules in this README,
-because a rule in a README is one a calling program can believe it has
-followed.
-
-## Dot-stuffing, and the truncation that reports success
-
-A line beginning with a dot is doubled, and the terminator is
-`\r\n.\r\n`.  A message whose body has a line that is just `.` ends the
-DATA early with no error at all: the server accepts half a message, and
-the rest is interpreted as commands.
-
-`smtpwire.data_body` stuffs and terminates in one function, because a
-caller that stuffed and forgot the terminator hangs and one that
-terminated without stuffing truncates — and only the first is visible.
-`transmitted_size` is what a `SIZE=` parameter carries, because the
-stuffed length is what actually travels and a client that declared the
-unstuffed one can be refused for a message that would have fitted.
-
-## Whether this earns an `smtp-codec-nv` row later
-
-Not yet, and the case for it is thin.
-
-`smtpwire` is the whole codec: a line, a three-digit number, a
-continuation character in column four, and dot-stuffing.  Perhaps two
-hundred lines of arithmetic when it is written, with none of the
-protocol's interesting behaviour in it — that is all in the
-conversation, which is `smtpsend`.  A separate package would be one
-whose README said "this parses `250 OK`", and nobody browses to that.
-
-Compare the three codecs this cohort sits over.  mqtt-codec-nv exists
-because a device runs the codec and not the client.  websocket-codec-nv
-exists because the framing is genuinely intricate — masking,
-fragmentation, sixteen close codes — and because a server, a proxy and
-a fuzzer all want it without a socket.  grpc-codec-nv exists because
-the call state machine is the protocol.  SMTP has none of those three
-properties: no device speaks SMTP, the framing is a line, and the state
-machine is nine states of "did the server say 2yz".
-
-**What would change it** is a second consumer that wants the codec and
-not the session: an SMTP *server*, a milter, or a proxy that rewrites
-envelopes.  If one of those appears on the grid, `smtpwire` lifts out
-unchanged — it is sans-IO already and its module comment says so — and
-the row is worth adding then.  Until then it would be a package split
-for symmetry, which is the reason this cohort's other splits exist and
-this one does not.
-
-## What this does not do, on purpose
-
-- **It is not a server.**  No listener, no queue, no relay decision.
-- **It does not deliver.**  Submission hands a message to a server that
-  will; MX lookup, retry schedules and bounce generation are that
-  server's.
-- **It does not sign.**  DKIM is a canonicalisation, a hash and an
-  RSA or Ed25519 signature over selected headers, and it belongs in its
-  own `core` package that `smtpmsg` would then depend on — an honest
-  missing row, and one nothing on the grid names yet.
-- **It does not parse a received message.**  Reading mail is IMAP and
-  a different RFC 5322 half — a parser rather than a builder — and a
-  package that did both would be two packages.
-- **It does not do SASL beyond three mechanisms.**  XOAUTH2 is what a
-  large provider wants now, and it is a token this package would only
-  base64: worth adding when a consumer needs it, and not worth a SASL
-  framework.
-- **It does not resolve names.**  A submission server is configured,
-  not discovered.
-- **No device claim.**  The package is `host`.
-
-## The reference implementation
-
-`lettre` (Rust) for the session shape and the transport split, and
-Python's `smtplib` for the command surface.  RFC 5321, RFC 5322, RFC
-6409, RFC 2045–2047, RFC 2195 and RFC 4616 are the specifications, and
-RFC 2195's own CRAM-MD5 example is a test vector.
-
-Three things change in the port.  `lettre`'s transport is an enum of
-the connections it knows about; here it is a trait, because STARTTLS
-needs a transport that can replace itself and a caller's own transport
-should be a first-class case.  Its `Message` builder is typed with a
-phantom state machine so a message without a recipient will not
-compile; here the check is `smtpmsg.render` answering
-`SmtpNoRecipients`, because the phantom-typed builder makes the common
-case harder to read and this package has only one place the check is
-needed.  And its `Tokio`/`async-std` split does not exist at all: there
-is one set of functions, effect-polymorphic over the transport, and a
-caller that wants them on a runtime supplies a transport that is.
-
-## Status
-
-| item | implemented |
+| Module | Contents |
 | --- | --- |
-| `smtpwire` — `SmtpCommand`, `SmtpReplyClass`, `SmtpReply`, `SmtpScan`, `SmtpReader`, `SmtpStep`, `SmtpCapabilities`, `SmtpWireError` | types only |
-| `smtpwire.SMTP_LINE_MAX`, `.SMTP_COMMAND_MAX`, `.SMTP_SUBMISSION_PORT`, `.SMTP_SUBMISSIONS_PORT`, `.SMTP_PORT` | yes — they are constants |
+| `smtpwire` | The command and reply codec. Commands as values, a multiline reply as one reply, the enhanced status code beside the three digits, the capability list, dot-stuffing with its terminator, and the pipelining rule. Nothing in it performs input or output. |
+| `smtpauth` | The three authentication mechanisms, each as a function from a server challenge to a response, and the rule for choosing between them. |
+| `smtpmsg` | The message: RFC 5322 headers, the envelope kept apart from them, MIME multipart bodies, base64 attachments, and the encoded-word form of a header that is not ASCII. |
+| `smtptrans` | The transport the session runs over. A plain TCP connection, a TLS connection, and the upgrade from the first to the second. |
+| `smtpsend` | The session. The greeting, EHLO, STARTTLS, authentication, the envelope, DATA, RSET and QUIT. |
+
+## How to choose an entry point
+
+**`smtpsend` is the whole conversation.** Call it when you want to send
+a message and have the package drive the exchange. Every session
+function takes the transport as an argument and costs whatever that
+transport costs, so the same code runs over TCP, over TLS, and over a
+recorded transcript in a test.
+
+**`smtpwire` is the codec on its own.** It turns bytes into replies and
+commands into bytes, and it performs nothing. Call it when you hold the
+connection yourself, or when you are writing something that reads SMTP
+without speaking it.
+
+**`smtpmsg` builds a message without sending one.** Call it when the
+message is going somewhere other than a socket.
+
+There are also two ways to open a connection. `smtptrans.dial_tcp` opens
+port 587 in the clear, and the session then upgrades it with STARTTLS.
+`smtptrans.dial_tls` opens port 465, which is encrypted from the first
+byte and has no STARTTLS at all. RFC 8314 section 3.3 prefers the
+second, because an offer of STARTTLS can be removed in transit and an
+already-encrypted connection cannot.
+
+## The rules a user needs
+
+1. **Everything the server said before STARTTLS is discarded.** RFC 3207
+   section 4.2 requires it. The capability list read over the plain
+   connection was the attacker's list if there was one, and acting on it
+   means a stripped `STARTTLS`, an invented `AUTH PLAIN`, or a shrunken
+   `SIZE`. `starttls` resets the session to
+   `smtpwire.no_capabilities()`, and `capabilities_of` answers the list
+   read after the upgrade and no other.
+2. **A second EHLO is required after the upgrade.** RFC 3207 section
+   4.2. `starttls` moves the session back to `SmtpGreeted`, so EHLO is
+   the only command it will then accept.
+3. **The server may send nothing between its `220` and the handshake.**
+   A client that buffered those bytes would obey them as replies to
+   commands it sends inside the TLS session, which is CVE-2011-0411.
+   `starttls` discards the read buffer, and a server that sent anything
+   gets `SmtpPipelinedAfterStartTls`.
+4. **Only the first digit of a reply code may be branched on.** RFC 5321
+   section 4.2.1. A client that retried a 550 sends the same rejection
+   until somebody stops it, and one that gave up on a 451 loses mail
+   that would have gone through in a minute. `class_of` and
+   `is_temporary` answer the question.
+5. **The envelope is not the headers.** RFC 5321 section 2.3.1.
+   `with_bcc` grows the envelope and touches no header, `with_to` and
+   `with_cc` grow both, and `envelope_recipients` is what `RCPT TO` is
+   issued for. It deduplicates, because an address that is both a `To`
+   and a `Cc` is one delivery.
+6. **A refused recipient is a value, not an error.** A message to twelve
+   people with one wrong address is eleven deliveries and one report.
+   `send_envelope` records the refusal and continues, and
+   `SmtpNoRecipientAccepted` arrives only when every recipient was
+   refused.
+7. **`data_body` stuffs the dots and appends the terminator together.**
+   RFC 5321 section 4.5.2. A caller that stuffed and forgot the
+   terminator hangs. A caller that terminated without stuffing sends
+   half a message, the server accepts it, and the rest is read as
+   commands.
+8. **A `SIZE=` parameter carries the transmitted size.** That is the
+   length after stuffing, which `transmitted_size` answers. A client
+   that declared the unstuffed length can be refused for a message that
+   would have fitted. RFC 1870 defines the parameter.
+9. **`EHLO`, `DATA`, `STARTTLS`, `QUIT` and every AUTH exchange are
+   pipelining barriers.** RFC 2920 section 3.1. Everything else may be
+   sent in a group, which turns a twelve-recipient message from thirteen
+   round trips into two. `may_pipeline` answers for a group.
+10. **PLAIN is preferred on an encrypted connection and refused without
+    one.** `best_mechanism` answers PLAIN, then CRAM-MD5, then LOGIN when
+    the connection is encrypted. Without encryption it answers CRAM-MD5
+    or nothing, because PLAIN over a cleartext wire is the password in
+    base64 and base64 is not encryption. `allow_cleartext` is how a
+    caller overrides that for a relay on the loopback interface.
+11. **The `Date:` header is RFC 5322 section 3.3's spelling, not RFC
+    3339's.** `Tue, 1 Jul 2003 10:52:37 +0200` is the form.
+    `date_header` produces it. A date in ISO spelling is one some readers
+    show as the epoch.
+12. **The date, the message identifier and the MIME boundary are
+    arguments.** None of them is drawn inside the package, so the same
+    message renders to the same bytes every time. `now_ms` is the one
+    function here that reads a clock.
+13. **A CR or an LF is refused where it would inject.** A newline in a
+    header value ends the header and begins another one the caller never
+    wrote, and `header_fault` refuses it before `render` writes it. The
+    same character in a command argument ends the command, and `encode`
+    refuses it with `SmtpControlCharacterInArgument`.
+
+## What is not included
+
+- **A server.** There is no listener, no queue and no relay decision.
+  This package is the client half.
+- **Delivery.** Submission hands a message to a server that will deliver
+  it. Looking up the recipient's MX records, retrying on a temporary
+  failure and generating a bounce are that server's work.
+- **A signature.** DKIM is a canonicalisation, a hash and a signature
+  over selected headers. It is
+  [dkim-nv](https://novo-lang.org/packages/dkim-nv), which takes the
+  bytes `smtpmsg.render` produces.
+- **Reading a received message.** That is a parser rather than a
+  builder, and fetching the message is IMAP or POP3. Neither is here.
+- **Authentication beyond three mechanisms.** XOAUTH2 is what a large
+  provider asks for now. It is a bearer token this package would only
+  base64, and it will be added when a consumer needs it.
+- **Name resolution.** A submission server is configured by the person
+  running the program, not discovered.
+- **A microcontroller build.** The package opens sockets and speaks TLS,
+  so it runs on a host.
+
+## Related packages
+
+- [dkim-nv](https://novo-lang.org/packages/dkim-nv) signs a message
+  before it is submitted. It takes the rendered headers and body, and it
+  answers the `DKIM-Signature` field value to put above them. It has no
+  socket and no resolver, which is why it is a separate package.
+- [mime-nv](https://novo-lang.org/packages/mime-nv) is the media type
+  grammar. `with_attachment` looks a filename up in its extension table.
+- [base64-nv](https://novo-lang.org/packages/base64-nv) is RFC 4648.
+  SMTP needs it in three places: the AUTH exchange, an attachment's
+  `Content-Transfer-Encoding`, and the encoded-word form of a header.
+- [crypto-nv](https://novo-lang.org/packages/crypto-nv) supplies the
+  HMAC-MD5 that CRAM-MD5 is built on, and nothing else.
+- [calendar-nv](https://novo-lang.org/packages/calendar-nv) supplies the
+  civil date arithmetic under the `Date:` header. It renders RFC 3339,
+  which is a different spelling, so the header is rendered here.
+- There is no `smtp-codec-nv` on the registry. `smtpwire` is that codec,
+  and it performs no input or output, so a program that wants the bytes
+  without the conversation can use it alone.
+- `std.net` and `std.tls` in the standard library are the socket and the
+  TLS session this package dials through. A caller that has its own
+  transport implements `SmtpTransport` over it instead.
+
+## Tests
+
+```bash
+novo test tests/smtpwire_tests.nv    # 22 tests over the codec and the mechanisms
+novo test tests/smtpsend_tests.nv    # 27 tests over the session and the message
+```
+
+The reference data is the specifications' own. RFC 2195's CRAM-MD5
+example, with its challenge, its shared secret and the digest it
+produces, is an assertion. RFC 4616's PLAIN example is another, and its
+leading empty authorization identity is the byte a naive implementation
+leaves out. The transcripts the codec is fed are EHLO capability lists in RFC
+5321's own shape, and the ports, the line limits and the two timeouts
+are asserted against the numbers the RFCs publish.
+
+The session suite runs an entire submission over `SmtpTape`, a transport
+whose bytes are already in memory. It implements `SmtpTransport[]`, so
+the compiler checks that a whole conversation, the STARTTLS upgrade
+included, costs no effects at all. The suite asserts that the upgrade
+empties the capability list, that a server speaking before the handshake
+is refused, that a blind recipient appears in the envelope and in no
+rendered header, and that the same message renders to the same bytes
+twice.
+
+The tests compile today and fail at run, each on the
+`not implemented: smtp-nv.<module>.<fn>` panic that is its body. That is
+the expected state of an interface release. They turn green one at a
+time as bodies land.
+
+## Implementation status
+
+| Item | Implemented |
+| --- | --- |
+| The `SMTP_LINE_MAX`, `SMTP_COMMAND_MAX` and the three port constants | yes (they are constants) |
+| `smtpmsg.HEADER_LINE_SOFT_MAX`, `.HEADER_LINE_HARD_MAX` | yes (they are constants) |
 | `smtpwire.reader`, `.reader_with`, `.scan`, `.feed`, `.take`, `.pending_len`, `.parse_reply` | no |
 | `smtpwire.class_of`, `.is_positive`, `.is_temporary`, `.encode` | no |
 | `smtpwire.capabilities_of`, `.no_capabilities`, `.may_pipeline` | no |
-| `smtpwire.data_body`, `.undo_dot_stuffing`, `.transmitted_size`, the `message` impl | no |
-| `smtpauth` — `SmtpMechanism`, `SmtpAuthStep`, `SmtpAuthState`, `SmtpAuthTurn`, `SmtpAuthError` | types only |
+| `smtpwire.data_body`, `.undo_dot_stuffing`, `.transmitted_size` | no |
 | `smtpauth.mechanism_name`, `.mechanism_of`, `.best_mechanism`, `.is_safe_without_tls` | no |
 | `smtpauth.begin`, `.initial_response`, `.answer`, `.is_done` | no |
-| `smtpauth.plain_response`, `.cram_md5_response`, the `message` impl | no |
-| `smtpmsg` — `SmtpHeader`, `SmtpBody`, `SmtpMessage`, `SmtpMessageError` | types only |
-| `smtpmsg.HEADER_LINE_SOFT_MAX`, `.HEADER_LINE_HARD_MAX` | yes — they are constants |
+| `smtpauth.plain_response`, `.cram_md5_response` | no |
 | `smtpmsg.message`, `.with_bcc`, `.with_to`, `.with_cc`, `.with_header`, `.in_thread` | no |
 | `smtpmsg.with_alternative`, `.with_attachment`, `.with_inline` | no |
 | `smtpmsg.render`, `.envelope_recipients`, `.date_header`, `.boundary` | no |
-| `smtpmsg.encoded_word`, `.needs_encoding`, `.header_fault`, `.fold`, the `message` impl | no |
-| `smtptrans` — `SmtpTransport[e]`, `SmtpTcp`, `SmtpTls` | types only |
+| `smtpmsg.encoded_word`, `.needs_encoding`, `.header_fault`, `.fold` | no |
 | `smtptrans.dial_tcp`, `.dial_tls`, `.tls_for`, `.stream_of` | no |
-| `smtptrans` — both `SmtpTransport` impls | no |
-| `smtpsend` — `SmtpSessionState`, `SmtpSessionOptions`, `SmtpSession`, `SmtpRefusal`, `SmtpSessionEvent`, `SmtpStepResult`, `SmtpUpgrade`, `SmtpSessionError` | types only |
+| `smtptrans`: both `SmtpTransport` implementations | no |
 | `smtpsend.default_options`, `.with_ehlo_domain`, `.allow_cleartext`, `.session` | no |
 | `smtpsend.state_of`, `.capabilities_of`, `.now_ms`, `.is_encrypted` | no |
 | `smtpsend.read_greeting`, `.ehlo`, `.starttls` | no |
 | `smtpsend.authenticate`, `.authenticate_with` | no |
 | `smtpsend.send_envelope`, `.send_data`, `.reset`, `.quit` | no |
-| `smtpsend.accepted_of`, `.refused_of`, `.is_temporary`, the `message` impl | no |
+| `smtpsend.accepted_of`, `.refused_of`, `.is_temporary` | no |
+| The four `Error` implementations, one per module that has an error | no |
+
+## Licence
+
+Apache-2.0. See `LICENSE`.
+
+<!-- docs/writing-a-readme.md is the style guide for this page. -->

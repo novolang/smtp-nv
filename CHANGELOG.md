@@ -5,6 +5,10 @@ All notable changes to smtp-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.2 — 2026-09-15
+
+README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.
+
 ## 0.0.1 — 2026-09-11
 
 The **interface**: every signature and every effect row, and no bodies.
@@ -62,3 +66,43 @@ The **interface**: every signature and every effect row, and no bodies.
 - **Four `core` dependencies**: mime-nv, base64-nv, crypto-nv and
   calendar-nv.
 - **No device claim.**  The package is `host`.
+
+### Design notes
+
+- **Why there is no `smtp-codec-nv`.**  `smtpwire` is the whole codec:
+  a line, a three-digit number, a continuation character in column
+  four, and dot-stuffing.  The three codec packages this cohort sits
+  over each exist for a reason SMTP does not have.  mqtt-codec-nv
+  exists because a device runs the codec and not the client.
+  websocket-codec-nv exists because the framing is intricate — masking,
+  fragmentation, sixteen close codes — and because a server, a proxy
+  and a fuzzer all want it without a socket.  grpc-codec-nv exists
+  because the call state machine is the protocol.  No device speaks
+  SMTP, the framing is a line, and the state machine is nine states of
+  "did the server say 2yz".  A second consumer that wants the codec and
+  not the session — a server, a milter, a proxy that rewrites
+  envelopes — is what would change it, and `smtpwire` is sans-IO
+  already, so it would lift out unchanged.
+- **Why `layer = "host"` rather than `layer = "core"` with
+  `host_modules`.**  The narrower layer with the wider modules named is
+  the shape for a package whose subject is the pure half.  This
+  package's subject is submitting a message over a socket, and the
+  codec is there because a session needs one.
+- **The effect rows, module by module.**  `smtpwire`, `smtpauth` and
+  `smtpmsg` are `[]` throughout.  `smtptrans.dial_tcp` is `[io, net]`,
+  which is `std.net`'s own row, and `smtptrans.dial_tls` is `[net]`,
+  which is `std.tls`'s and is narrower.  `smtpsend.now_ms` is `[time]`
+  and is the one function in the package that reads a clock.  Every
+  session function in `smtpsend` is effect-polymorphic over the
+  transport.
+- **What changed in the port.**  `lettre` (Rust) supplied the session
+  shape and the transport split; Python's `smtplib` supplied the
+  command surface.  Three things differ.  `lettre`'s transport is an
+  enum of the connections it knows about, and here it is a trait,
+  because STARTTLS needs a transport that can replace itself and a
+  caller's own transport should be a first-class case.  Its `Message`
+  builder is typed with a phantom state machine, so a message without a
+  recipient does not compile; here the check is `smtpmsg.render`
+  answering `SmtpNoRecipients`.  Its `Tokio`/`async-std` split does not
+  exist at all: there is one set of functions, effect-polymorphic over
+  the transport.

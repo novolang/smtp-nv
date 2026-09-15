@@ -1,6 +1,6 @@
 [package]
 name        = "smtp-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "SMTP submission (RFC 6409): EHLO and the capability list, STARTTLS as a transport that replaces itself, AUTH PLAIN, LOGIN and CRAM-MD5, the envelope and DATA with dot-stuffing, pipelining, and an RFC 5322 message builder with MIME multipart bodies.  The command and reply codec is a sans-IO module of this package.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
