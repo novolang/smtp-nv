@@ -158,7 +158,7 @@ specification the implementation will have to satisfy.
 | `smtpwire` | The command and reply codec. Commands as values, a multiline reply as one reply, the enhanced status code beside the three digits, the capability list, dot-stuffing with its terminator, and the pipelining rule. Nothing in it performs input or output. |
 | `smtpauth` | The three authentication mechanisms, each as a function from a server challenge to a response, and the rule for choosing between them. |
 | `smtpmsg` | The message: RFC 5322 headers, the envelope kept apart from them, MIME multipart bodies, base64 attachments, and the encoded-word form of a header that is not ASCII. |
-| `smtptrans` | The transport the session runs over. A plain TCP connection, a TLS connection, and the upgrade from the first to the second. |
+| `smtptrans` | The transport the session runs over. A plain TCP connection, a TLS connection with its options record, and the upgrade from the first to the second. |
 | `smtpsend` | The session. The greeting, EHLO, STARTTLS, authentication, the envelope, DATA, RSET and QUIT. |
 
 ## How to choose an entry point
@@ -289,9 +289,13 @@ already-encrypted connection cannot.
 - There is no `smtp-codec-nv` on the registry. `smtpwire` is that codec,
   and it performs no input or output, so a program that wants the bytes
   without the conversation can use it alone.
-- `std.net` and `std.tls` in the standard library are the socket and the
-  TLS session this package dials through. A caller that has its own
-  transport implements `SmtpTransport` over it instead.
+- `std.net` in the standard library is the socket this package dials
+  through. The TLS session beside it is an opaque handle, and its
+  options are `smtptrans.SmtpTlsConfig` — this package's own record,
+  because the standard library's TLS surface is not published (there is
+  no `docs/stdlib/tls.md` and no module a `use` resolves), so no package
+  can name a type from it. A caller that has its own transport
+  implements `SmtpTransport` over it instead.
 
 ## Tests
 

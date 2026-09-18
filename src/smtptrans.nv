@@ -41,7 +41,7 @@ pub trait SmtpTransport[e]
     // Take this connection into TLS, answering the transport that
     // replaces it.  The one method the other transports in this lane
     // have no equivalent of, and the reason the trait exists rather
-    // than a `?TlsConfig` on the options.
+    // than a `?SmtpTlsConfig` on the options.
     fn smtp_upgrade(self, hostname: Str) -> Result<SmtpTls, IoError> [e]
     // Whether this transport is encrypted.  Asked of the transport and
     // not of a flag the session kept, because the flag is what an
@@ -59,6 +59,35 @@ pub struct SmtpTcp
 pub struct SmtpTls
     conn: Int
     hostname: Str
+
+// The TLS options `dial_tls` opens a connection with.
+//
+// THE PACKAGE DECLARES IT rather than naming a standard library type.
+// `compiler/stdlib/tls.nv` holds a struct of this shape, but it is not
+// a published surface: there is no `docs/stdlib/tls.md`, no `use`
+// brings the module into scope, and a signature naming its type
+// type-checked only while the undefined-type check did not exist.  It
+// does now, and it is `E2033`.
+//
+// AND THE NAME IS PREFIXED because struct identity is keyed by NAME
+// across a whole assembly, dependencies included: two packages that
+// each declared a bare `TlsConfig` could not be used by the same
+// program.  docs/publishing.md, "Public type names are globally
+// unique".
+//
+// `hostname` is both the SNI sent and the name the server's
+// certificate is matched against — one field, because a program that
+// could set them apart would have a way to verify the wrong name.
+//
+// ONLY `dial_tls` TAKES ONE.  `smtp_upgrade` takes a hostname and
+// nothing else, because STARTTLS happens inside a conversation that is
+// already open: there is no second set of options to apply to a socket
+// the caller already handed over, and offering one would suggest the
+// upgrade could verify against a different name than the dial did.
+pub struct SmtpTlsConfig
+    hostname: Str
+    verify_peer: Bool
+    ca_bundle_path: Str
 
 // Open a plain connection to a submission server.
 //
@@ -88,7 +117,7 @@ pub fn dial_tcp(host: Str, port: Int) -> Result<SmtpTcp, IoError> [io, net]
 // fn main() [io]
 //     println("${smtpwire.SMTP_SUBMISSIONS_PORT}")
 // ```
-pub fn dial_tls(host: Str, port: Int, cfg: TlsConfig) -> Result<SmtpTls, IoError> [net]
+pub fn dial_tls(host: Str, port: Int, cfg: SmtpTlsConfig) -> Result<SmtpTls, IoError> [net]
     todo("smtp-nv.smtptrans.dial_tls")
 
 // A client-side TLS configuration for a hostname, with peer
@@ -101,7 +130,7 @@ pub fn dial_tls(host: Str, port: Int, cfg: TlsConfig) -> Result<SmtpTls, IoError
 //     let cfg = smtptrans.tls_for("smtp.example.com")
 //     println("${smtpwire.SMTP_SUBMISSIONS_PORT}")
 // ```
-pub fn tls_for(hostname: Str) -> TlsConfig []
+pub fn tls_for(hostname: Str) -> SmtpTlsConfig []
     todo("smtp-nv.smtptrans.tls_for")
 
 // The TcpStream inside, for a caller that has to set a socket option
