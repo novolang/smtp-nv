@@ -1,6 +1,6 @@
 [package]
 name        = "smtp-nv"
-version     = "0.0.2"
+version     = "0.0.3"
 description = "SMTP submission (RFC 6409): EHLO and the capability list, STARTTLS as a transport that replaces itself, AUTH PLAIN, LOGIN and CRAM-MD5, the envelope and DATA with dot-stuffing, pipelining, and an RFC 5322 message builder with MIME multipart bodies.  The command and reply codec is a sans-IO module of this package.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
@@ -33,7 +33,12 @@ category    = "networking"
 tags        = ["smtp", "email", "submission", "rfc5322", "mime", "starttls", "auth"]
 repository  = "https://github.com/novolang/smtp-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.8.9"
+# `>= 0.9.1` and not `>= 0.8.9`: `smtptrans` names `TlsConfig`, the
+# standard library's record, which no toolchain before 0.9.1 has a
+# reachable module for.  `std.tls` existed in 0.9.0 and could not be
+# named — no `use` resolved it — which is the whole reason 0.0.2
+# carried an `SmtpTlsConfig` of its own.
+novo        = ">= 0.9.1"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
